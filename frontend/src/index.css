@@ -1,0 +1,8 @@
+@import "tailwindcss";
+
+@theme {
+  --color-map-ground: #2d4a3e;
+  --color-map-path: #3d5a4e;
+  --color-radiant: #4a9eff;
+  --color-dire: #ff4a4a;
+}

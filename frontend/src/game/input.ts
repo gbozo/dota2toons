@@ -28,7 +28,7 @@ import * as THREE from 'three';
 export type MoveCallback     = (worldX: number, worldY: number) => void;
 export type AttackCallback   = (entityId: string) => void;
 export type SelectCallback   = (entityId: string | null) => void;
-export type AbilityCallback  = (slot: 0 | 1 | 2 | 3) => void;
+export type AbilityCallback  = (slot: 0 | 1 | 2 | 3, targetEntityId?: string, targetX?: number, targetY?: number) => void;
 export type StopCallback     = () => void;
 
 interface InputConfig {
@@ -88,6 +88,11 @@ export class InputManager {
   private cursorRing: THREE.Mesh;
   private cursorFadeTimer = 0;
   private readonly CURSOR_FADE_DURATION = 800; // ms
+
+  // Ability targeting mode
+  /** When set, the next left/right click targets this ability slot */
+  pendingAbilitySlot: (0 | 1 | 2 | 3) | null = null;
+  pendingAbilityType: 'point' | 'unit_target' | null = null;
 
   // Callbacks
   private onMove:    MoveCallback;
@@ -149,24 +154,46 @@ export class InputManager {
     const onContextMenu = (e: MouseEvent) => e.preventDefault();
 
     const onMouseDown = (e: MouseEvent) => {
-      // Only act on clicks directly on the canvas
       if (e.target !== this.canvas) return;
       this.updateNDC(e);
 
+      // ── Ability targeting mode ────────────────────────────────────────────
+      if (this.pendingAbilitySlot !== null) {
+        const slot = this.pendingAbilitySlot;
+        const type = this.pendingAbilityType;
+        this.pendingAbilitySlot = null;
+        this.pendingAbilityType = null;
+
+        if (e.button === 2) {
+          // Right-click cancels targeting
+          return;
+        }
+        if (type === 'unit_target') {
+          const entityId = this.pickEntity();
+          if (entityId) this.onAbility(slot, entityId, undefined, undefined);
+        } else if (type === 'point') {
+          const hit = this.raycastGround();
+          if (hit) {
+            this.onAbility(slot, undefined, hit.x, hit.z);
+            this.showCursorRing(hit);
+          }
+        }
+        return;
+      }
+
+      // ── Normal click ──────────────────────────────────────────────────────
       if (e.button === 2) {
-        // Right-click — try entity pick first, then ground
         const entityId = this.pickEntity();
         if (entityId) {
           this.onAttack(entityId);
         } else {
           const hit = this.raycastGround();
           if (hit) {
-            this.onMove(hit.x, hit.z); // Three.js Z = game Y
+            this.onMove(hit.x, hit.z);
             this.showCursorRing(hit);
           }
         }
       } else if (e.button === 0) {
-        // Left-click — select entity or deselect
         const entityId = this.pickEntity();
         this.onSelect(entityId);
       }

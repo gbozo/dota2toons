@@ -304,3 +304,129 @@ export interface RespawnComponent extends Component {
 export function createRespawnComponent(x: number, y: number): RespawnComponent {
   return { componentId: RespawnComponentId, spawnX: x, spawnY: y };
 }
+
+// ---------------------------------------------------------------------------
+// AbilityComponent — per-hero ability slots with runtime state
+// ---------------------------------------------------------------------------
+
+export const AbilityComponentId = 'ability';
+
+export interface AbilitySlotState {
+  abilityId: string;
+  level: number;          // 0 = not yet levelled, 1-3 active
+  cooldownEndsAt: number; // game time ms when ability comes off CD
+  /** Pending cast state set by InputManager, consumed by AbilitySystem */
+  pendingCast: {
+    targetEntityId?: string;
+    targetX?: number;
+    targetY?: number;
+  } | null;
+}
+
+export interface AbilityComponent extends Component {
+  componentId: typeof AbilityComponentId;
+  slots: [AbilitySlotState, AbilitySlotState, AbilitySlotState, AbilitySlotState];
+  /** Skill points available to spend */
+  skillPoints: number;
+}
+
+export function createAbilityComponent(abilityIds: [string, string, string, string]): AbilityComponent {
+  return {
+    componentId: AbilityComponentId,
+    slots: abilityIds.map(id => ({
+      abilityId: id,
+      level: 0,
+      cooldownEndsAt: 0,
+      pendingCast: null,
+    })) as AbilityComponent['slots'],
+    skillPoints: 0,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// StatusEffectsComponent — active debuffs/buffs on a unit
+// ---------------------------------------------------------------------------
+
+export const StatusEffectsComponentId = 'statusEffects';
+
+export interface ActiveStatusEffect {
+  type: string;         // 'stun' | 'slow' | 'root' | 'silence' | 'taunt'
+  expiresAt: number;    // game time ms
+  magnitude?: number;   // e.g. slow factor 0.5
+  sourceEntityId: string;
+}
+
+export interface StatusEffectsComponent extends Component {
+  componentId: typeof StatusEffectsComponentId;
+  effects: ActiveStatusEffect[];
+}
+
+export function createStatusEffectsComponent(): StatusEffectsComponent {
+  return { componentId: StatusEffectsComponentId, effects: [] };
+}
+
+export function hasStatus(comp: StatusEffectsComponent, type: string, now: number): boolean {
+  return comp.effects.some(e => e.type === type && e.expiresAt > now);
+}
+
+export function addStatus(
+  comp: StatusEffectsComponent,
+  type: string,
+  durationMs: number,
+  now: number,
+  sourceEntityId: string,
+  magnitude?: number
+): void {
+  // Replace existing effect of same type if new duration is longer
+  const existing = comp.effects.findIndex(e => e.type === type);
+  const newEffect: ActiveStatusEffect = {
+    type, expiresAt: now + durationMs, magnitude, sourceEntityId,
+  };
+  if (existing >= 0) {
+    if (newEffect.expiresAt > comp.effects[existing].expiresAt) {
+      comp.effects[existing] = newEffect;
+    }
+  } else {
+    comp.effects.push(newEffect);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ProjectileComponent — moving projectile entities
+// ---------------------------------------------------------------------------
+
+export const ProjectileComponentId = 'projectile';
+
+export interface ProjectileComponent extends Component {
+  componentId: typeof ProjectileComponentId;
+  /** Who fired it */
+  ownerId: string;
+  ownerTeam: string;
+  /** Target (for homing) or null (for point-targeted, moves in straight line) */
+  targetEntityId: string | null;
+  /** Fixed destination for point projectiles */
+  destX: number;
+  destY: number;
+  speed: number;   // world units / sec
+  /** Effect JSON string — parsed by AbilitySystem on hit */
+  effectJson: string;
+  /** Visual radius for AoE on arrival */
+  aoeRadius: number;
+}
+
+export function createProjectileComponent(
+  ownerId: string,
+  ownerTeam: string,
+  destX: number, destY: number,
+  speed: number,
+  effectJson: string,
+  targetEntityId: string | null = null,
+  aoeRadius = 0
+): ProjectileComponent {
+  return {
+    componentId: ProjectileComponentId,
+    ownerId, ownerTeam,
+    targetEntityId, destX, destY,
+    speed, effectJson, aoeRadius,
+  };
+}

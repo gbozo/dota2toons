@@ -17,6 +17,7 @@ import { CreepSpawnerSystem, CreepAISystem, SeparationSystem, parseLaneWaypoints
 import { CombatSystem } from './systems/combat';
 import { TowerAISystem, parseTowerDefs, towerStatsForTier } from './systems/tower';
 import { EconomySystem, RespawnSystem } from './systems/economy';
+import { AbilitySystem, StatusSystem } from './systems/ability';
 import { createDebugGrid, addLabel, MouseCoordTracker } from './game/debug';
 
 import {
@@ -30,15 +31,20 @@ import {
   createSelectionComponent,
   createInventoryComponent,
   createRespawnComponent,
+  createAbilityComponent,
+  createStatusEffectsComponent,
   PositionComponentId,
   SelectionComponentId,
   UnitTypeComponentId,
   TeamComponentId,
   InventoryComponentId,
+  AbilityComponentId,
   type PositionComponent,
   type SelectionComponent,
   type UnitTypeComponent,
+  type AbilityComponent,
 } from './components/index';
+import { HERO_ABILITIES, ABILITY_BY_ID } from './data/heroAbilities';
 import type { MapData, Team } from './types/game';
 
 // ---------------------------------------------------------------------------
@@ -53,73 +59,230 @@ const ELEVATION_SCALE = 80; // world units per elevation level
 
 interface UIState {
   status: string;
+  mouseCoord: string;
+  // Top bar
+  gameClock: number;   // seconds
+  killsRadiant: number;
+  killsDire: number;
+  // Bottom bar — local hero
   selectedHero: string | null;
+  heroHp: number;
+  heroMaxHp: number;
+  heroMana: number;
+  heroMaxMana: number;
   gold: number;
   level: number;
-  mouseCoord: string;
+  xp: number;
+  xpToNext: number;
+  // Ability bar
+  abilities: Array<{
+    name: string;
+    key: string;
+    cooldownPct: number;  // 0 = ready, 1 = full cooldown
+    manaCost: number;
+    level: number;
+  }>;
+  // Kill feed events
+  killFeed: Array<{ id: number; text: string; color: string }>;
 }
 
+// ── Colour palette ──────────────────────────────────────────────────────────
+const C = {
+  radiant: '#4a9eff',
+  dire:    '#ff4a4a',
+  gold:    '#ffd700',
+  hp:      '#22cc22',
+  mana:    '#4488ff',
+  xp:      '#cc88ff',
+  bg:      'rgba(10,14,20,0.85)',
+  bgLight: 'rgba(20,28,40,0.9)',
+  border:  'rgba(80,100,130,0.6)',
+};
+
+// ── Reusable bar component ──────────────────────────────────────────────────
+function Bar({ value, max, color, height = 6 }: { value: number; max: number; color: string; height?: number }) {
+  const pct = max > 0 ? Math.max(0, Math.min(1, value / max)) : 0;
+  return (
+    <div style={{ width: '100%', height, background: 'rgba(0,0,0,0.5)', borderRadius: 2, overflow: 'hidden' }}>
+      <div style={{ width: `${pct * 100}%`, height: '100%', background: color, borderRadius: 2, transition: 'width 0.1s' }} />
+    </div>
+  );
+}
+
+// ── TopBar ──────────────────────────────────────────────────────────────────
+function TopBar({ ui }: { ui: UIState }) {
+  const mins = Math.floor(ui.gameClock / 60);
+  const secs = ui.gameClock % 60;
+  const clock = `${mins}:${secs.toString().padStart(2, '0')}`;
+  return (
+    <div style={{
+      position: 'absolute', top: 0, left: '50%', transform: 'translateX(-50%)',
+      display: 'flex', alignItems: 'center', gap: 12,
+      background: C.bg, border: `1px solid ${C.border}`,
+      borderTop: 'none', borderRadius: '0 0 8px 8px',
+      padding: '4px 16px', fontFamily: 'monospace', fontSize: '13px',
+      pointerEvents: 'none',
+    }}>
+      <span style={{ color: C.radiant, fontWeight: 'bold' }}>{ui.killsRadiant}</span>
+      <span style={{ color: '#666' }}>–</span>
+      <span style={{ color: '#888' }}>{clock}</span>
+      <span style={{ color: '#666' }}>–</span>
+      <span style={{ color: C.dire, fontWeight: 'bold' }}>{ui.killsDire}</span>
+    </div>
+  );
+}
+
+// ── BottomBar ───────────────────────────────────────────────────────────────
+function BottomBar({ ui }: { ui: UIState }) {
+  if (!ui.selectedHero) return null;
+  const xpPct = ui.xpToNext > 0 ? ui.xp / ui.xpToNext : 1;
+  void xpPct;
+  return (
+    <div style={{
+      position: 'absolute', bottom: 0, left: '50%', transform: 'translateX(-50%)',
+      display: 'flex', alignItems: 'stretch', gap: 10,
+      background: C.bg, border: `1px solid ${C.border}`,
+      borderBottom: 'none', borderRadius: '8px 8px 0 0',
+      padding: '10px 16px', fontFamily: 'monospace',
+      pointerEvents: 'none', minWidth: 320,
+    }}>
+      {/* Hero portrait placeholder */}
+      <div style={{
+        width: 54, height: 54, flexShrink: 0,
+        background: C.bgLight, border: `2px solid ${C.border}`,
+        borderRadius: 6, display: 'flex', alignItems: 'center', justifyContent: 'center',
+        color: '#aaa', fontSize: 10, textAlign: 'center',
+      }}>
+        {ui.selectedHero?.split(' ')[0].toUpperCase().slice(0, 3) ?? '?'}
+      </div>
+
+      {/* Stats */}
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 4, justifyContent: 'center' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: '#ccc' }}>
+          <span style={{ color: C.hp }}>{Math.ceil(ui.heroHp)} / {ui.heroMaxHp}</span>
+          <span style={{ color: C.mana }}>{Math.ceil(ui.heroMana)} / {ui.heroMaxMana}</span>
+        </div>
+        <Bar value={ui.heroHp}   max={ui.heroMaxHp}   color={C.hp}   height={7} />
+        <Bar value={ui.heroMana} max={ui.heroMaxMana} color={C.mana} height={5} />
+        <Bar value={ui.xp} max={ui.xpToNext} color={C.xp} height={3} />
+      </div>
+
+      {/* Level + Gold */}
+      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', justifyContent: 'center', gap: 4, fontSize: 12 }}>
+        <div style={{ color: C.xp }}>Lv {ui.level}</div>
+        <div style={{ color: C.gold }}>⬡ {Math.floor(ui.gold)}</div>
+      </div>
+
+      {/* Ability bar */}
+      {ui.abilities.length > 0 && (
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginLeft: 8 }}>
+          {ui.abilities.map((ab, i) => {
+            const keys = ['Q','W','E','R'];
+            const isReady = ab.cooldownPct <= 0;
+            const notLearned = ab.level === 0;
+            return (
+              <div key={i} style={{
+                width: 44, height: 44, position: 'relative',
+                background: notLearned ? 'rgba(0,0,0,0.5)' : C.bgLight,
+                border: `1px solid ${isReady && !notLearned ? C.border : '#333'}`,
+                borderRadius: 4, display: 'flex', flexDirection: 'column',
+                alignItems: 'center', justifyContent: 'center',
+                opacity: notLearned ? 0.4 : 1,
+                overflow: 'hidden',
+              }}>
+                {/* Cooldown overlay */}
+                {!isReady && (
+                  <div style={{
+                    position: 'absolute', bottom: 0, left: 0, right: 0,
+                    height: `${ab.cooldownPct * 100}%`,
+                    background: 'rgba(0,0,0,0.6)',
+                  }} />
+                )}
+                <div style={{ fontSize: 9, color: '#888', zIndex: 1 }}>{keys[i]}</div>
+                <div style={{ fontSize: 8, color: '#ccc', zIndex: 1, textAlign: 'center',
+                  maxWidth: 40, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {ab.name.split(' ').map(w => w[0]).join('')}
+                </div>
+                {ab.manaCost > 0 && (
+                  <div style={{ fontSize: 7, color: C.mana, zIndex: 1 }}>{ab.manaCost}</div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── KillFeed ────────────────────────────────────────────────────────────────
+function KillFeed({ events }: { events: UIState['killFeed'] }) {
+  if (events.length === 0) return null;
+  return (
+    <div style={{
+      position: 'absolute', top: 48, right: 8,
+      display: 'flex', flexDirection: 'column', gap: 3,
+      fontFamily: 'monospace', fontSize: '11px', pointerEvents: 'none',
+    }}>
+      {events.map(e => (
+        <div key={e.id} style={{
+          background: C.bg, border: `1px solid ${C.border}`,
+          borderRadius: 4, padding: '2px 8px',
+          color: e.color, whiteSpace: 'nowrap',
+        }}>
+          {e.text}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── HUD root ────────────────────────────────────────────────────────────────
 function HUD({ ui, onSetUI }: { ui: UIState; onSetUI: (s: Partial<UIState>) => void }) {
   void onSetUI;
   return (
     <>
+      {/* Status message */}
       {ui.status && (
         <div style={{
           position: 'absolute', top: 8, left: 8, color: '#fff',
           fontFamily: 'monospace', fontSize: '12px',
-          background: 'rgba(0,0,0,0.6)', padding: '4px 10px', borderRadius: 4,
+          background: C.bg, padding: '4px 10px', borderRadius: 4,
           pointerEvents: 'none',
         }}>
           {ui.status}
         </div>
       )}
 
-      {/* Debug: mouse coord + grid + elevation */}
+      {/* Mouse coord debug */}
       <div id="mouse-coord" style={{
-        position: 'absolute', top: 8, left: '50%', transform: 'translateX(-50%)',
-        fontFamily: 'monospace', fontSize: '12px',
-        background: 'rgba(0,0,0,0.7)', padding: '4px 14px', borderRadius: 4,
-        pointerEvents: 'none', whiteSpace: 'nowrap', textAlign: 'center',
+        position: 'absolute', top: 36, left: '50%', transform: 'translateX(-50%)',
+        fontFamily: 'monospace', fontSize: '11px',
+        background: 'rgba(0,0,0,0.55)', padding: '2px 10px', borderRadius: 4,
+        pointerEvents: 'none', whiteSpace: 'nowrap', color: '#667',
       }}>
         map: —
       </div>
 
-      {/* 2D canvas for health bars — drawn by game loop each frame */}
+      {/* 2D canvas for health bars + minimap */}
       <canvas id="hud-canvas" style={{
         position: 'absolute', top: 0, left: 0,
         width: '100%', height: '100%',
         pointerEvents: 'none',
       }} />
 
-      {ui.selectedHero && (
-        <div style={{
-          position: 'absolute', bottom: 16, left: '50%', transform: 'translateX(-50%)',
-          color: '#ffd700', fontFamily: 'monospace', fontSize: '13px',
-          background: 'rgba(0,0,0,0.65)', padding: '6px 16px',
-          borderRadius: 6, pointerEvents: 'none', border: '1px solid #ffd700',
-        }}>
-          {ui.selectedHero}
-        </div>
-      )}
+      <TopBar ui={ui} />
+      <BottomBar ui={ui} />
+      <KillFeed events={ui.killFeed} />
 
+      {/* Controls hint */}
       <div style={{
-        position: 'absolute', bottom: 8, right: 12,
-        color: '#ffd700', fontFamily: 'monospace', fontSize: '13px', pointerEvents: 'none',
-        lineHeight: 1.7,
-      }}>
-        <div>Gold: {ui.gold}</div>
-        <div style={{ color: '#cc88ff' }}>Level: {ui.level}</div>
-      </div>
-
-      <div style={{
-        position: 'absolute', top: 8, right: 12,
-        color: '#aaa', fontFamily: 'monospace', fontSize: '11px',
+        position: 'absolute', top: 8, right: 8,
+        color: '#555', fontFamily: 'monospace', fontSize: '10px',
         pointerEvents: 'none', lineHeight: 1.7, textAlign: 'right',
       }}>
-        Right-click: move / attack<br />
-        Left-click: select<br />
-        WASD / scroll: camera<br />
-        Space: center on hero
+        RMB: move/attack&nbsp;&nbsp;LMB: select<br />
+        WASD: camera&nbsp;&nbsp;Scroll: zoom&nbsp;&nbsp;Space: follow
       </div>
     </>
   );
@@ -187,7 +350,9 @@ class Game {
   private creepSpawner: CreepSpawnerSystem | null = null;
   private creepAI      = new CreepAISystem();
   private towerAI      = new TowerAISystem();
-  private combatSystem = new CombatSystem();
+  private combatSystem  = new CombatSystem();
+  private abilitySystem = new AbilitySystem();
+  private statusSystem  = new StatusSystem();
   private economySystem = new EconomySystem();
   private respawnSystem = new RespawnSystem();
   private separation   = new SeparationSystem();
@@ -228,12 +393,13 @@ class Game {
 
     this.movementSystem = new MovementSystem(this.mapData.gridNav, this.mapData.elevation, objectBlocked);
     this.pathfinding    = new Pathfinding(this.mapData.gridNav, this.mapData.elevation, objectBlocked);
+    this.world.registerSystem(this.statusSystem);
     this.world.registerSystem(this.movementSystem);
     this.world.registerSystem(this.animSystem);
-
-    // Creep systems
+    this.abilitySystem.setCombatSystem(this.combatSystem);
+    this.world.registerSystem(this.abilitySystem);
     const laneWaypoints = parseLaneWaypoints(this.mapData.lanes);
-    this.creepSpawner = new CreepSpawnerSystem(laneWaypoints);
+    this.creepSpawner   = new CreepSpawnerSystem(laneWaypoints);
     this.world.registerSystem(this.creepSpawner);
     this.world.registerSystem(this.creepAI);
     this.world.registerSystem(this.towerAI);
@@ -351,9 +517,10 @@ class Game {
       entityMeshMap: this.entityMeshMap,
       scene: this.scene,
       onMove:    (x, z) => this.handleMove(x, z),
-      onAttack:  (id)   => console.log('attack →', id),
+      onAttack:  (id)   => this.handleAttackCommand(id),
       onSelect:  (id)   => this.handleSelect(id),
-      onAbility: (slot) => console.log('ability', slot),
+      onAbility: (slot, targetEntityId, targetX, targetZ) =>
+        this.handleAbility(slot, targetEntityId, targetX, targetZ !== undefined ? -targetZ : undefined),
       onStop:    ()     => this.handleStop(),
       onHold:    ()     => this.handleStop(),
     });
@@ -410,8 +577,21 @@ class Game {
     this.world.addComponent(entity.id, createCombatComponent(45, 55, 150, 1.7, 2));
     this.world.addComponent(entity.id, createPathComponent());
     this.world.addComponent(entity.id, createSelectionComponent(false));
-    this.world.addComponent(entity.id, createInventoryComponent(600)); // starting gold
-    this.world.addComponent(entity.id, createRespawnComponent(gameX, gameY)); // respawn here
+    this.world.addComponent(entity.id, createInventoryComponent(600));
+    this.world.addComponent(entity.id, createRespawnComponent(gameX, gameY));
+    this.world.addComponent(entity.id, createStatusEffectsComponent());
+
+    // Add ability slots from hero definition
+    const defs = HERO_ABILITIES[heroKey];
+    if (defs && defs.length >= 4) {
+      const ids = defs.slice(0, 4).map(d => d.id) as [string, string, string, string];
+      const ab = createAbilityComponent(ids);
+      ab.slots[0].level = 1; // start with level 1 in each ability
+      ab.slots[1].level = 1;
+      ab.slots[2].level = 1;
+      ab.slots[3].level = 1;
+      this.world.addComponent(entity.id, ab);
+    }
 
     const selRing = makeSelectionRing();
 
@@ -473,6 +653,54 @@ class Game {
   }
 
   // ── input handlers ────────────────────────────────────────────────────────
+
+  private handleAttackCommand(targetId: string): void {
+    if (!this.selectedId) return;
+    const combat = this.world.getComponent<any>(this.selectedId, 'combat');
+    if (combat) combat.targetId = targetId;
+  }
+
+  private handleAbility(
+    slot: 0 | 1 | 2 | 3,
+    targetEntityId?: string,
+    targetX?: number,
+    targetY?: number
+  ): void {
+    const heroId = this.selectedId ?? this.localHeroId;
+    if (!heroId) return;
+
+    const ab = this.world.getComponent<AbilityComponent>(heroId, AbilityComponentId);
+    if (!ab) return;
+
+    const slotState = ab.slots[slot];
+    if (!slotState || slotState.level === 0) return;
+
+    const def = ABILITY_BY_ID.get(slotState.abilityId);
+    if (!def) return;
+
+    // For abilities that need targeting: enter targeting mode if no target provided yet
+    if (def.abilityType === 'unit_target' && !targetEntityId) {
+      if (this.inputMgr) {
+        this.inputMgr.pendingAbilitySlot = slot;
+        this.inputMgr.pendingAbilityType = 'unit_target';
+        this.setUI(s => ({ ...s, status: `Select target for ${def.name}` }));
+        setTimeout(() => this.setUI(s => ({ ...s, status: '' })), 3000);
+      }
+      return;
+    }
+    if (def.abilityType === 'point' && targetX === undefined) {
+      if (this.inputMgr) {
+        this.inputMgr.pendingAbilitySlot = slot;
+        this.inputMgr.pendingAbilityType = 'point';
+        this.setUI(s => ({ ...s, status: `Select point for ${def.name}` }));
+        setTimeout(() => this.setUI(s => ({ ...s, status: '' })), 3000);
+      }
+      return;
+    }
+
+    // Set pending cast — AbilitySystem consumes it next tick
+    slotState.pendingCast = { targetEntityId, targetX, targetY };
+  }
 
   private handleMove(threeX: number, threeZ: number): void {
     if (!this.selectedId || !this.pathfinding) return;
@@ -561,9 +789,10 @@ class Game {
       this.animSystem.updateMixers(dtSec);
       this.inputMgr?.update(frame);
 
+      this.processDeathsForUI();
       this.syncMeshes(dtSec, alpha);
       this.syncCreeps(alpha);
-      this.syncHudStats();
+      this.syncHudStats(frame);
       this.renderer?.render(this.scene!, this.camera!);
       this.drawHealthBars();
       this.rafId = requestAnimationFrame(loop);
@@ -738,21 +967,98 @@ class Game {
       ctx.fillStyle = isRadiant ? '#4a9eff' : '#ff4a4a';
       ctx.fillRect(bx - 3, sy, 2, BAR_H);
     }
+
+    this.drawMinimap(ctx, W, H);
   }
 
-  private lastGold = -1;
-  private lastLevel = -1;
-  private syncHudStats(): void {
-    if (!this.localHeroId) return;
-    const inv = this.world.getComponent<any>(this.localHeroId, InventoryComponentId);
-    if (!inv) return;
-    const g = Math.floor(inv.gold);
-    const l = inv.level;
-    if (g !== this.lastGold || l !== this.lastLevel) {
-      this.lastGold  = g;
-      this.lastLevel = l;
-      this.setUI(s => ({ ...s, gold: g, level: l }));
+  private gameClockMs  = 0;
+  private killFeedSeq  = 0;
+  private killsRadiant = 0;
+  private killsDire    = 0;
+
+  /** Called each tick to process death events for kill feed + scoreboard. */
+  private processDeathsForUI(): void {
+    for (const evt of this.combatSystem.deathEvents) {
+      const ut   = this.world.getComponent<any>(evt.entityId, 'unitType');
+      const team = this.world.getComponent<any>(evt.entityId, 'team');
+      const name = ut?.subtype || ut?.type || '?';
+
+      // Kill score
+      if (team?.team === 'radiant') this.killsDire++;
+      else this.killsRadiant++;
+
+      // Kill feed text
+      const killerUT = evt.killerId
+        ? this.world.getComponent<any>(evt.killerId, 'unitType')
+        : null;
+      const killerName = killerUT?.subtype || killerUT?.type || 'environment';
+      const color = team?.team === 'radiant' ? C.dire : C.radiant;
+      const text  = `${killerName} killed ${name}`;
+      const id    = ++this.killFeedSeq;
+
+      this.setUI(s => ({
+        ...s,
+        killsRadiant: this.killsRadiant,
+        killsDire: this.killsDire,
+        killFeed: [...s.killFeed.slice(-4), { id, text, color }],
+      }));
+
+      // Auto-dismiss after 5 s
+      setTimeout(() => {
+        this.setUI(s => ({ ...s, killFeed: s.killFeed.filter(e => e.id !== id) }));
+      }, 5000);
     }
+  }
+
+  private syncHudStats(dtMs: number): void {
+    this.gameClockMs += dtMs;
+    const clockSec = Math.floor(this.gameClockMs / 1000);
+
+    if (!this.localHeroId) return;
+
+    const inv  = this.world.getComponent<any>(this.localHeroId, InventoryComponentId);
+    const hp   = this.world.getComponent<any>(this.localHeroId, 'health');
+    const ut   = this.world.getComponent<any>(this.localHeroId, 'unitType');
+    const ab   = this.world.getComponent<AbilityComponent>(this.localHeroId, AbilityComponentId);
+    const dead = this.world.hasComponent(this.localHeroId, 'dead');
+
+    const heroName = dead
+      ? `${ut?.subtype ?? '?'} (respawning...)`
+      : ut?.subtype ?? null;
+
+    // Build ability bar data
+    const abilities: UIState['abilities'] = [];
+    if (ab) {
+      const now = this.gameClockMs; // use local clock for CD display
+      for (const slot of ab.slots) {
+        const def = ABILITY_BY_ID.get(slot.abilityId);
+        if (!def) continue;
+        const cdTotal = def.cooldownPerLevel[Math.max(0, slot.level - 1)] ?? 1;
+        const cdRemaining = Math.max(0, slot.cooldownEndsAt - now);
+        abilities.push({
+          name:        def.name,
+          key:         ['Q','W','E','R'][def.slot],
+          cooldownPct: cdTotal > 0 ? cdRemaining / cdTotal : 0,
+          manaCost:    def.manaCostPerLevel[Math.max(0, slot.level - 1)] ?? 0,
+          level:       slot.level,
+        });
+      }
+    }
+
+    this.setUI(s => ({
+      ...s,
+      gameClock:    clockSec,
+      selectedHero: heroName,
+      gold:         Math.floor(inv?.gold ?? s.gold),
+      level:        inv?.level ?? s.level,
+      xp:           inv?.xp ?? s.xp,
+      xpToNext:     inv?.xpToNextLevel ?? s.xpToNext,
+      heroHp:       hp?.hp    ?? s.heroHp,
+      heroMaxHp:    hp?.maxHp ?? s.heroMaxHp,
+      heroMana:     hp?.mana  ?? s.heroMana,
+      heroMaxMana:  hp?.maxMana ?? s.heroMaxMana,
+      abilities,
+    }));
   }
 
   centerOnHero(): void {
@@ -769,7 +1075,91 @@ class Game {
     this.mouseTracker?.dispose();
     this.renderer?.dispose();
   }
-}
+
+  private drawMinimap(ctx: CanvasRenderingContext2D, W: number, H: number): void {
+    const SIZE   = Math.min(W, H) * 0.18; // 18% of smaller dimension
+    const PAD    = 10;
+    const mx     = PAD;
+    const my     = H - SIZE - PAD;
+    const MAP    = 20928; // world units
+
+    // Background
+    ctx.fillStyle = 'rgba(10,18,28,0.85)';
+    ctx.strokeStyle = 'rgba(80,120,180,0.6)';
+    ctx.lineWidth = 1;
+    ctx.fillRect(mx, my, SIZE, SIZE);
+    ctx.strokeRect(mx, my, SIZE, SIZE);
+
+    const toScreen = (gx: number, gy: number): [number, number] => {
+      // game X → minimap X (left=-10464, right=+10464)
+      // game Y → minimap Y (bottom=-10464=Radiant, top=+10464=Dire)
+      const nx = (gx + MAP / 2) / MAP;
+      const ny = 1 - (gy + MAP / 2) / MAP; // flip Y so Radiant is at bottom
+      return [mx + nx * SIZE, my + ny * SIZE];
+    };
+
+    // Draw river diagonal hint
+    ctx.strokeStyle = 'rgba(42,90,122,0.5)';
+    ctx.lineWidth = SIZE * 0.04;
+    ctx.beginPath();
+    const [r0x, r0y] = toScreen(-MAP / 2, MAP / 2);
+    const [r1x, r1y] = toScreen(MAP / 2, -MAP / 2);
+    ctx.moveTo(r0x, r0y); ctx.lineTo(r1x, r1y);
+    ctx.stroke();
+    ctx.lineWidth = 1;
+
+    // Draw towers
+    for (const entity of this.world.entities.values()) {
+      if (!entity.active) continue;
+      const ut   = this.world.getComponent<any>(entity.id, 'unitType');
+      const pos  = this.world.getComponent<PositionComponent>(entity.id, PositionComponentId);
+      const team = this.world.getComponent<any>(entity.id, 'team');
+      const hp   = this.world.getComponent<any>(entity.id, 'health');
+      if (ut?.type !== 'tower' || !pos || !team) continue;
+
+      const [sx, sy] = toScreen(pos.x, pos.y);
+      const alive = !hp || hp.hp > 0;
+      ctx.fillStyle = alive
+        ? (team.team === 'radiant' ? C.radiant : C.dire)
+        : 'rgba(80,80,80,0.5)';
+      ctx.fillRect(sx - 2, sy - 2, 4, 4);
+    }
+
+    // Draw creeps
+    for (const entity of this.world.entities.values()) {
+      if (!entity.active) continue;
+      const laneAI = this.world.getComponent<any>(entity.id, 'laneAI');
+      const pos    = this.world.getComponent<PositionComponent>(entity.id, PositionComponentId);
+      const team   = this.world.getComponent<any>(entity.id, 'team');
+      if (!laneAI || !pos || !team) continue;
+      const [sx, sy] = toScreen(pos.x, pos.y);
+      ctx.fillStyle = team.team === 'radiant' ? C.radiant : C.dire;
+      ctx.beginPath();
+      ctx.arc(sx, sy, 1.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Draw heroes
+    for (const [id, rec] of this.entities) {
+      const pos  = this.world.getComponent<PositionComponent>(id, PositionComponentId);
+      const dead = this.world.hasComponent(id, 'dead');
+      if (!pos) continue;
+      const [sx, sy] = toScreen(pos.x, pos.y);
+      const isLocal = id === this.localHeroId;
+      ctx.fillStyle = dead ? '#555'
+        : rec.team === 'radiant' ? C.radiant : C.dire;
+      ctx.beginPath();
+      ctx.arc(sx, sy, isLocal ? 4 : 3, 0, Math.PI * 2);
+      ctx.fill();
+      if (isLocal) {
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        ctx.lineWidth = 1;
+      }
+    }
+  }
+} // end class Game
 
 // ---------------------------------------------------------------------------
 // Bootstrap
@@ -785,7 +1175,12 @@ let updateUI: ((fn: (prev: UIState) => UIState) => void) | null = null;
 
 function Root() {
   const [ui, setUI] = React.useState<UIState>({
-    status: 'Initializing...', selectedHero: null, gold: 600, level: 1, mouseCoord: '',
+    status: 'Initializing...', mouseCoord: '',
+    gameClock: 0, killsRadiant: 0, killsDire: 0,
+    selectedHero: null, heroHp: 600, heroMaxHp: 600, heroMana: 200, heroMaxMana: 200,
+    gold: 600, level: 1, xp: 0, xpToNext: 230,
+    abilities: [],
+    killFeed: [],
   });
   React.useEffect(() => {
     updateUI = setUI;

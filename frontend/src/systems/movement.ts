@@ -412,7 +412,7 @@ export class Pathfinding {
     return smooth.map((p) => ({ x: this.toWorld(p.c), y: this.toWorld(p.r) }));
   }
 
-  /** Bresenham line-of-sight check on the walkability grid. */
+  /** Bresenham line-of-sight check — also guards diagonal corner-cutting. */
   private hasLOS(a: { c: number; r: number }, b: { c: number; r: number }): boolean {
     let x0 = a.c, y0 = a.r;
     const x1 = b.c, y1 = b.r;
@@ -426,6 +426,12 @@ export class Pathfinding {
       if (!this.walkableAt(x0, y0)) return false;
       if (x0 === x1 && y0 === y1) break;
       const e2 = 2 * err;
+      // When the line steps diagonally, check both adjacent cardinal cells
+      // to prevent cutting through blocked corners (same rule as A* diagonals)
+      if (e2 > -dy && e2 < dx) {
+        // Diagonal step about to happen — check both cardinals
+        if (!this.walkableAt(x0 + sx, y0) || !this.walkableAt(x0, y0 + sy)) return false;
+      }
       if (e2 > -dy) { err -= dy; x0 += sx; }
       if (e2 < dx)  { err += dx; y0 += sy; }
     }

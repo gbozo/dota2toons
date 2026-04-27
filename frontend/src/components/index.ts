@@ -144,27 +144,27 @@ export function createHealthComponent(
 
 export const CombatComponentId = 'combat';
 
-export interface AttackStats {
-  damageMin: number;
-  damageMax: number;
-  attackRange: number;
-  attackSpeed: number;
-}
-
 export interface CombatComponent extends Component {
   componentId: typeof CombatComponentId;
   damageMin: number;
   damageMax: number;
   attackRange: number;
-  attackSpeed: number;
+  /** Base attack time in seconds (1.0 = 1 attack/sec at 0 bonus) */
+  baseAttackTime: number;
+  /** Attack speed bonus % (0 = base rate) */
+  attackSpeedBonus: number;
+  armor: number;
   lastAttackTime: number;
+  /** Entity ID of current attack target, or null */
+  targetId: string | null;
 }
 
 export function createCombatComponent(
   damageMin = 10,
   damageMax = 20,
   attackRange = 100,
-  attackSpeed = 1.0,
+  baseAttackTime = 1.7,
+  armor = 0,
   lastAttackTime = 0
 ): CombatComponent {
   return {
@@ -172,8 +172,11 @@ export function createCombatComponent(
     damageMin,
     damageMax,
     attackRange,
-    attackSpeed,
+    baseAttackTime,
+    attackSpeedBonus: 0,
+    armor,
     lastAttackTime,
+    targetId: null,
   };
 }
 
@@ -244,4 +247,60 @@ export function createSelectionComponent(selected = false): SelectionComponent {
     componentId: SelectionComponentId,
     selected,
   };
+}
+
+export const DeadComponentId = 'dead';
+
+export interface DeadComponent extends Component {
+  componentId: typeof DeadComponentId;
+  /** Game time (ms) when this entity died — used for respawn timer */
+  diedAt: number;
+}
+
+export function createDeadComponent(diedAt: number): DeadComponent {
+  return { componentId: DeadComponentId, diedAt };
+}
+
+// ---------------------------------------------------------------------------
+// Inventory / Economy — gold, XP, level (heroes only)
+// ---------------------------------------------------------------------------
+
+export const InventoryComponentId = 'inventory';
+
+export interface InventoryComponent extends Component {
+  componentId: typeof InventoryComponentId;
+  gold: number;
+  xp: number;
+  level: number;
+  /** XP accumulated toward next level */
+  xpToNextLevel: number;
+}
+
+// XP required to reach each level (SPEC table)
+export const XP_PER_LEVEL = [0, 230, 370, 480, 580, 600, 720, 750, 890, 930, 1050];
+
+export function createInventoryComponent(startingGold = 600): InventoryComponent {
+  return {
+    componentId: InventoryComponentId,
+    gold: startingGold,
+    xp: 0,
+    level: 1,
+    xpToNextLevel: XP_PER_LEVEL[1],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Respawn — tracks respawn position for heroes
+// ---------------------------------------------------------------------------
+
+export const RespawnComponentId = 'respawn';
+
+export interface RespawnComponent extends Component {
+  componentId: typeof RespawnComponentId;
+  spawnX: number;
+  spawnY: number;
+}
+
+export function createRespawnComponent(x: number, y: number): RespawnComponent {
+  return { componentId: RespawnComponentId, spawnX: x, spawnY: y };
 }

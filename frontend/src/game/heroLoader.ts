@@ -220,9 +220,11 @@ export class HeroModelLoader {
     // The GLTF (ClayGL fbx2gltf) has a baked root-node matrix that rotates
     // Z-up FBX → Y-up Three.js. The hero stands ~160 native units tall after
     // that rotation. We wrap it in a root group that syncMeshes drives.
-    // Scale 0.5 → ~80 world units tall (close to one 64-unit grid cell).
+    // Scale 0.4 → body width ~62 world units ≈ 1 grid cell (64 units).
+    // Height ~66 world units, slightly above 1 grid cell.
+    // This matches the visible footprint of heroes in Dota 2 relative to the map grid.
     const info = HERO_DATA[heroKey];
-    const s = (info?.scale ?? 1.0) * 2.0;
+    const s = (info?.scale ?? 1.0) * 0.4;
 
     const root = new THREE.Group();
     root.name = heroKey;
@@ -344,19 +346,19 @@ export class HeroModelLoader {
     const info = HERO_DATA[heroKey];
     const color = info?.fallbackColor ?? 0xff00ff;
 
-    // Body
+    // Body — sized to match scale=0.4 GLTF: ~44 wide × 55 tall × 28 deep
     const body = new THREE.Mesh(
-      new THREE.BoxGeometry(44, 80, 28),
+      new THREE.BoxGeometry(44, 55, 28),
       new THREE.MeshLambertMaterial({ color })
     );
-    body.position.y = 40;
+    body.position.y = 27;
 
-    // Head
+    // Head — smaller to match
     const head = new THREE.Mesh(
-      new THREE.SphereGeometry(18, 8, 8),
+      new THREE.SphereGeometry(12, 8, 8),
       new THREE.MeshLambertMaterial({ color })
     );
-    head.position.y = 100;
+    head.position.y = 66;
 
     const group = new THREE.Group();
     group.add(body, head);

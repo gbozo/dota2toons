@@ -13,6 +13,10 @@ import type { HeroInstance } from './game/heroLoader';
 import { InputManager } from './game/input';
 import { MovementSystem, Pathfinding } from './systems/movement';
 import { AnimationSystem } from './systems/animation';
+import { CreepSpawnerSystem, CreepAISystem, SeparationSystem, parseLaneWaypoints, LaneAIComponentId } from './systems/creep';
+import { CombatSystem } from './systems/combat';
+import { TowerAISystem, parseTowerDefs, towerStatsForTier } from './systems/tower';
+import { EconomySystem, RespawnSystem } from './systems/economy';
 import { createDebugGrid, addLabel, MouseCoordTracker } from './game/debug';
 
 import {
@@ -21,11 +25,16 @@ import {
   createTeamComponent,
   createUnitTypeComponent,
   createHealthComponent,
+  createCombatComponent,
   createPathComponent,
   createSelectionComponent,
+  createInventoryComponent,
+  createRespawnComponent,
   PositionComponentId,
   SelectionComponentId,
   UnitTypeComponentId,
+  TeamComponentId,
+  InventoryComponentId,
   type PositionComponent,
   type SelectionComponent,
   type UnitTypeComponent,
@@ -46,6 +55,7 @@ interface UIState {
   status: string;
   selectedHero: string | null;
   gold: number;
+  level: number;
   mouseCoord: string;
 }
 
@@ -74,6 +84,13 @@ function HUD({ ui, onSetUI }: { ui: UIState; onSetUI: (s: Partial<UIState>) => v
         map: —
       </div>
 
+      {/* 2D canvas for health bars — drawn by game loop each frame */}
+      <canvas id="hud-canvas" style={{
+        position: 'absolute', top: 0, left: 0,
+        width: '100%', height: '100%',
+        pointerEvents: 'none',
+      }} />
+
       {ui.selectedHero && (
         <div style={{
           position: 'absolute', bottom: 16, left: '50%', transform: 'translateX(-50%)',
@@ -88,8 +105,10 @@ function HUD({ ui, onSetUI }: { ui: UIState; onSetUI: (s: Partial<UIState>) => v
       <div style={{
         position: 'absolute', bottom: 8, right: 12,
         color: '#ffd700', fontFamily: 'monospace', fontSize: '13px', pointerEvents: 'none',
+        lineHeight: 1.7,
       }}>
-        Gold: {ui.gold}
+        <div>Gold: {ui.gold}</div>
+        <div style={{ color: '#cc88ff' }}>Level: {ui.level}</div>
       </div>
 
       <div style={{
@@ -120,7 +139,7 @@ interface GameEntityRecord {
 }
 
 function makeSelectionRing(): THREE.Mesh {
-  const geo = new THREE.RingGeometry(40, 50, 32);
+  const geo = new THREE.RingGeometry(32, 38, 32); // ~1 grid cell diameter
   const mat = new THREE.MeshBasicMaterial({
     color: 0x44ff88, side: THREE.DoubleSide,
     transparent: true, opacity: 0.85, depthWrite: false,
@@ -132,6 +151,11 @@ function makeSelectionRing(): THREE.Mesh {
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Debug flag — set to true to show grid overlay and walkable mesh
+// ---------------------------------------------------------------------------
+const DEBUG_MAP = false;
+
 // Game
 // ---------------------------------------------------------------------------
 
@@ -149,6 +173,8 @@ class Game {
   private cameraCtrl: CameraController | null = null;
   private inputMgr: InputManager | null = null;
   private mouseTracker: MouseCoordTracker | null = null;
+  private hudCanvas: HTMLCanvasElement | null = null;
+  private hudCtx: CanvasRenderingContext2D | null = null;
 
   private heroLoader  = new HeroModelLoader('/heroes');
   private heroGroup: THREE.Group | null = null;
@@ -157,8 +183,23 @@ class Game {
   private selectedId: string | null = null;
   private localHeroId: string | null = null;
 
+  // Creep + combat systems
+  private creepSpawner: CreepSpawnerSystem | null = null;
+  private creepAI      = new CreepAISystem();
+  private towerAI      = new TowerAISystem();
+  private combatSystem = new CombatSystem();
+  private economySystem = new EconomySystem();
+  private respawnSystem = new RespawnSystem();
+  private separation   = new SeparationSystem();
+  // Creep visuals — one InstancedMesh per team, updated each frame
+  private creepMeshRadiant: THREE.InstancedMesh | null = null;
+  private creepMeshDire:    THREE.InstancedMesh | null = null;
+  private readonly MAX_CREEPS = 200; // max visible creeps per team
+
   // Smoothed render rotation per entity (interpolated toward pos.rotation each frame)
   private renderRotation = new Map<string, number>();
+  // Previous-tick positions for render interpolation
+  private prevPos = new Map<string, { x: number; y: number; z: number }>();
 
   private rafId       = 0;
   private lastFrame   = 0;
@@ -189,6 +230,17 @@ class Game {
     this.pathfinding    = new Pathfinding(this.mapData.gridNav, this.mapData.elevation, objectBlocked);
     this.world.registerSystem(this.movementSystem);
     this.world.registerSystem(this.animSystem);
+
+    // Creep systems
+    const laneWaypoints = parseLaneWaypoints(this.mapData.lanes);
+    this.creepSpawner = new CreepSpawnerSystem(laneWaypoints);
+    this.world.registerSystem(this.creepSpawner);
+    this.world.registerSystem(this.creepAI);
+    this.world.registerSystem(this.towerAI);
+    this.world.registerSystem(this.combatSystem);
+    this.world.registerSystem(this.economySystem);
+    this.world.registerSystem(this.respawnSystem);
+    this.world.registerSystem(this.separation);
 
     // Renderer
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
@@ -223,16 +275,47 @@ class Game {
     const buildings = createBuildingMeshes(this.mapData, this.mapData.elevation);
     this.scene.add(buildings);
 
-    // Debug grid + labels
-    this.scene.add(createDebugGrid());
+    // Spawn tower ECS entities so TowerAISystem + CombatSystem can process them
+    this.spawnTowers();
 
-    // Walkable cell overlay (debug)
-    this.scene.add(createWalkableMesh(this.mapData.gridNav, this.mapData.elevation, objectBlocked));
+    if (DEBUG_MAP) {
+      this.scene.add(createDebugGrid());
+      this.scene.add(createWalkableMesh(this.mapData.gridNav, this.mapData.elevation, objectBlocked));
+    }
 
     // Hero group
     this.heroGroup = new THREE.Group();
     this.heroGroup.name = 'heroes';
     this.scene.add(this.heroGroup);
+
+    // Creep instanced meshes — simple capsule shapes, team-colored
+    const creepGeo = new THREE.CapsuleGeometry(20, 40, 4, 8);
+    this.creepMeshRadiant = new THREE.InstancedMesh(
+      creepGeo,
+      new THREE.MeshLambertMaterial({ color: 0x4a9eff }),
+      this.MAX_CREEPS
+    );
+    this.creepMeshRadiant.name = 'creeps_radiant';
+    this.creepMeshRadiant.count = 0;
+    this.scene.add(this.creepMeshRadiant);
+
+    this.creepMeshDire = new THREE.InstancedMesh(
+      creepGeo,
+      new THREE.MeshLambertMaterial({ color: 0xff4a4a }),
+      this.MAX_CREEPS
+    );
+    this.creepMeshDire.name = 'creeps_dire';
+    this.creepMeshDire.count = 0;
+    this.scene.add(this.creepMeshDire);
+
+    // HUD canvas for health bars
+    const hc = document.getElementById('hud-canvas') as HTMLCanvasElement | null;
+    if (hc) {
+      hc.width  = canvas.clientWidth;
+      hc.height = canvas.clientHeight;
+      this.hudCanvas = hc;
+      this.hudCtx    = hc.getContext('2d');
+    }
 
     // Mouse coord tracker — now that scene objects exist
     coordEl = document.getElementById('mouse-coord');
@@ -289,6 +372,10 @@ class Game {
     window.addEventListener('resize', () => {
       canvas.width  = window.innerWidth;
       canvas.height = window.innerHeight;
+      if (this.hudCanvas) {
+        this.hudCanvas.width  = window.innerWidth;
+        this.hudCanvas.height = window.innerHeight;
+      }
       this.cameraCtrl?.onResize(window.innerWidth, window.innerHeight);
     });
 
@@ -320,8 +407,11 @@ class Game {
     this.world.addComponent(entity.id, createTeamComponent(team));
     this.world.addComponent(entity.id, createUnitTypeComponent('hero', heroKey));
     this.world.addComponent(entity.id, createHealthComponent(600, 600, 200, 200));
+    this.world.addComponent(entity.id, createCombatComponent(45, 55, 150, 1.7, 2));
     this.world.addComponent(entity.id, createPathComponent());
     this.world.addComponent(entity.id, createSelectionComponent(false));
+    this.world.addComponent(entity.id, createInventoryComponent(600)); // starting gold
+    this.world.addComponent(entity.id, createRespawnComponent(gameX, gameY)); // respawn here
 
     const selRing = makeSelectionRing();
 
@@ -364,20 +454,49 @@ class Game {
     }).catch(() => {});
   }
 
+  private spawnTowers(): void {
+    if (!this.mapData) return;
+    const defs = parseTowerDefs(this.mapData.buildings);
+    for (const def of defs) {
+      const stats = towerStatsForTier(def.tier);
+      const entity = this.world.createEntity();
+      const elev = this.movementSystem!.getElevation(def.x, def.y);
+      this.world.addComponent(entity.id, createPositionComponent(def.x, def.y, elev));
+      this.world.addComponent(entity.id, createTeamComponent(def.team));
+      this.world.addComponent(entity.id, createUnitTypeComponent('tower', `tier${def.tier}`));
+      this.world.addComponent(entity.id, createHealthComponent(stats.hp, stats.hp, 0, 0));
+      // Tower: damage, range, 1.0s base attack, 0 armor, no current target
+      this.world.addComponent(entity.id, createCombatComponent(
+        stats.damage, stats.damage, stats.range, 1.0, 0
+      ));
+    }
+  }
+
   // ── input handlers ────────────────────────────────────────────────────────
 
   private handleMove(threeX: number, threeZ: number): void {
     if (!this.selectedId || !this.pathfinding) return;
     const pos = this.world.getComponent<PositionComponent>(this.selectedId, PositionComponentId);
     if (!pos) return;
-    // Convert Three.js hit point back to game coords: gameX=threeX, gameY=-threeZ
     const gameX = threeX;
     const gameY = -threeZ;
-    const wps = this.pathfinding.findPath(pos.x, pos.y, gameX, gameY);
+
+    // Snap start position to the nearest grid cell so A* always starts
+    // from a clean grid-aligned position. This prevents the path from
+    // starting mid-cell and warping on new commands issued mid-movement.
+    const GRID = 64;
+    const snapX = Math.round(pos.x / GRID) * GRID;
+    const snapY = Math.round(pos.y / GRID) * GRID;
+
+    const wps = this.pathfinding.findPath(snapX, snapY, gameX, gameY);
     if (!wps.length) return;
     const path = this.world.getComponent<any>(this.selectedId, 'path');
     if (!path) return;
-    path.waypoints = wps;
+
+    // Prepend the hero's exact current position as waypoint[0] so movement
+    // continues smoothly from wherever the hero is right now, not from the
+    // snapped grid cell (which could be slightly behind/ahead).
+    path.waypoints = [{ x: pos.x, y: pos.y }, ...wps];
     path.currentWaypointIndex = 0;
     path.reachedTarget = false;
     path.targetX = gameX;
@@ -427,31 +546,56 @@ class Game {
 
       this.accumulator += frame;
       while (this.accumulator >= this.TICK) {
+        this.economySystem.feedDeathEvents(this.combatSystem.deathEvents);
+        // Snapshot previous positions before the tick for interpolation
+        this.snapshotPrevPositions();
         this.world.update(this.TICK);
         this.accumulator -= this.TICK;
       }
+
+      // Render interpolation alpha: how far between the last tick and the next
+      const alpha = this.accumulator / this.TICK;
 
       const dtSec = frame / 1000;
       this.cameraCtrl?.update(dtSec);
       this.animSystem.updateMixers(dtSec);
       this.inputMgr?.update(frame);
 
-      this.syncMeshes(dtSec);
+      this.syncMeshes(dtSec, alpha);
+      this.syncCreeps(alpha);
+      this.syncHudStats();
       this.renderer?.render(this.scene!, this.camera!);
+      this.drawHealthBars();
       this.rafId = requestAnimationFrame(loop);
     };
     this.rafId = requestAnimationFrame(loop);
   }
 
   // Rotation turn speed: radians per second
-  private readonly TURN_SPEED = Math.PI * 3; // 540°/s — snappy but not instant
+  private readonly TURN_SPEED = Math.PI * 3;
 
-  private syncMeshes(dtSec: number): void {
+  /** Snapshot current ECS positions before each tick — used for render interpolation. */
+  private snapshotPrevPositions(): void {
+    for (const entity of this.world.entities.values()) {
+      if (!entity.active) continue;
+      const pos = this.world.getComponent<PositionComponent>(entity.id, PositionComponentId);
+      if (pos) this.prevPos.set(entity.id, { x: pos.x, y: pos.y, z: pos.z });
+    }
+  }
+
+  private syncMeshes(dtSec: number, alpha = 1): void {
     for (const [id, rec] of this.entities) {
       const pos = this.world.getComponent<PositionComponent>(id, PositionComponentId);
       if (!pos) continue;
-      const worldY = pos.z * ELEVATION_SCALE;
-      rec.instance.root.position.set(pos.x, worldY, -pos.y);
+
+      // Interpolate between previous tick position and current (alpha = 0..1)
+      const prev = this.prevPos.get(id);
+      const rx = prev ? prev.x + (pos.x - prev.x) * alpha : pos.x;
+      const ry = prev ? prev.y + (pos.y - prev.y) * alpha : pos.y;
+      const rz = prev ? prev.z + (pos.z - prev.z) * alpha : pos.z;
+
+      const worldY = rz * ELEVATION_SCALE;
+      rec.instance.root.position.set(rx, worldY, -ry);
 
       // Smooth rotation — lerp current render angle toward ECS target angle
       // using shortest angular path to avoid spinning the long way round
@@ -468,7 +612,146 @@ class Game {
       this.renderRotation.set(id, current);
 
       rec.instance.root.rotation.y = Math.atan2(-Math.cos(current), Math.sin(current));
-      rec.label.position.set(pos.x, worldY + 350, -pos.y);
+      rec.label.position.set(pos.x, worldY + 80, -pos.y);
+    }
+  }
+
+  private syncCreeps(alpha = 1): void {
+    if (!this.creepMeshRadiant || !this.creepMeshDire) return;
+
+    const matrix   = new THREE.Matrix4();
+    const pos3     = new THREE.Vector3();
+    const quat     = new THREE.Quaternion();
+    const scale    = new THREE.Vector3(1, 1, 1);
+
+    let ri = 0;
+    let di = 0;
+
+    for (const entity of this.world.entities.values()) {
+      if (!entity.active) continue;
+      const laneAI = this.world.getComponent<any>(entity.id, LaneAIComponentId);
+      if (!laneAI) continue;
+
+      const pos  = this.world.getComponent<PositionComponent>(entity.id, PositionComponentId);
+      const team = this.world.getComponent<any>(entity.id, TeamComponentId);
+      if (!pos || !team) continue;
+
+      // Interpolate position
+      const prev = this.prevPos.get(entity.id);
+      const rx = prev ? prev.x + (pos.x - prev.x) * alpha : pos.x;
+      const ry = prev ? prev.y + (pos.y - prev.y) * alpha : pos.y;
+      const rz = prev ? prev.z + (pos.z - prev.z) * alpha : pos.z;
+
+      const worldY = rz * ELEVATION_SCALE + 40;
+      pos3.set(rx, worldY, -ry);
+
+      // Rotate to face movement direction
+      const facingY = Math.atan2(-Math.cos(pos.rotation), Math.sin(pos.rotation));
+      quat.setFromAxisAngle(new THREE.Vector3(0, 1, 0), facingY);
+      matrix.compose(pos3, quat, scale);
+
+      if (team.team === 'radiant' && ri < this.MAX_CREEPS) {
+        this.creepMeshRadiant.setMatrixAt(ri++, matrix);
+      } else if (team.team === 'dire' && di < this.MAX_CREEPS) {
+        this.creepMeshDire.setMatrixAt(di++, matrix);
+      }
+    }
+
+    this.creepMeshRadiant.count = ri;
+    this.creepMeshRadiant.instanceMatrix.needsUpdate = true;
+    this.creepMeshDire.count = di;
+    this.creepMeshDire.instanceMatrix.needsUpdate = true;
+  }
+
+  private readonly _screenPos = new THREE.Vector3();
+
+   private drawHealthBars(): void {
+    const ctx = this.hudCtx;
+    const cam = this.camera;
+    if (!ctx || !cam || !this.hudCanvas) return;
+
+    const W = this.hudCanvas.width;
+    const H = this.hudCanvas.height;
+    ctx.clearRect(0, 0, W, H);
+
+    const BAR_W  = 40;
+    const BAR_H  = 5;
+    const BAR_Y_OFFSET = -8;
+
+    for (const entity of this.world.entities.values()) {
+      if (!entity.active) continue;
+
+      const pos  = this.world.getComponent<PositionComponent>(entity.id, PositionComponentId);
+      const hp   = this.world.getComponent<any>(entity.id, 'health');
+      const ut   = this.world.getComponent<any>(entity.id, 'unitType');
+      const team = this.world.getComponent<any>(entity.id, 'team');
+      const dead = this.world.getComponent<any>(entity.id, 'dead');
+      if (!pos || !hp || hp.maxHp <= 0) continue;
+
+      const isHero = ut?.type === 'hero';
+
+      // For dead heroes — show respawn countdown at their spawn position
+      if (dead && isHero) {
+        const inv   = this.world.getComponent<any>(entity.id, InventoryComponentId);
+        const spawn = this.world.getComponent<any>(entity.id, 'respawn');
+        if (!spawn) continue;
+        const respawnMs = ((inv?.level ?? 1) * 2 + 4) * 1000;
+        const elapsed   = Date.now() - dead.diedAt;
+        const remaining = Math.max(0, Math.ceil((respawnMs - elapsed) / 1000));
+        this._screenPos.set(spawn.spawnX, pos.z * ELEVATION_SCALE + 80, -spawn.spawnY);
+        this._screenPos.project(cam);
+        if (this._screenPos.z > 1) continue;
+        const sx = ( this._screenPos.x + 1) / 2 * W;
+        const sy = (-this._screenPos.y + 1) / 2 * H;
+        ctx.font = 'bold 12px monospace';
+        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+        ctx.fillText(`Respawn ${remaining}s`, sx - 28, sy + 1);
+        ctx.fillStyle = '#ffaa44';
+        ctx.fillText(`Respawn ${remaining}s`, sx - 28, sy);
+        continue;
+      }
+      if (dead) continue; // non-hero dead units don't render
+
+      // Project world position to screen
+      const worldY = pos.z * ELEVATION_SCALE + (isHero ? 80 : 50);
+      this._screenPos.set(pos.x, worldY, -pos.y);
+      this._screenPos.project(cam);
+
+      if (this._screenPos.z > 1) continue;
+      const sx = ( this._screenPos.x + 1) / 2 * W;
+      const sy = (-this._screenPos.y + 1) / 2 * H + BAR_Y_OFFSET;
+      if (sx < -BAR_W || sx > W + BAR_W || sy < 0 || sy > H) continue;
+
+      const pct = hp.hp / hp.maxHp;
+      const bx  = sx - BAR_W / 2;
+
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      ctx.fillRect(bx - 1, sy - 1, BAR_W + 2, BAR_H + 2);
+
+      const isSelected = entity.id === this.selectedId;
+      const isRadiant   = team?.team === 'radiant';
+      ctx.fillStyle = isSelected ? '#ffd700'
+        : pct > 0.5 ? '#22cc22'
+        : pct > 0.25 ? '#ddaa00' : '#cc2222';
+      ctx.fillRect(bx, sy, BAR_W * pct, BAR_H);
+
+      ctx.fillStyle = isRadiant ? '#4a9eff' : '#ff4a4a';
+      ctx.fillRect(bx - 3, sy, 2, BAR_H);
+    }
+  }
+
+  private lastGold = -1;
+  private lastLevel = -1;
+  private syncHudStats(): void {
+    if (!this.localHeroId) return;
+    const inv = this.world.getComponent<any>(this.localHeroId, InventoryComponentId);
+    if (!inv) return;
+    const g = Math.floor(inv.gold);
+    const l = inv.level;
+    if (g !== this.lastGold || l !== this.lastLevel) {
+      this.lastGold  = g;
+      this.lastLevel = l;
+      this.setUI(s => ({ ...s, gold: g, level: l }));
     }
   }
 
@@ -502,7 +785,7 @@ let updateUI: ((fn: (prev: UIState) => UIState) => void) | null = null;
 
 function Root() {
   const [ui, setUI] = React.useState<UIState>({
-    status: 'Initializing...', selectedHero: null, gold: 600, mouseCoord: '',
+    status: 'Initializing...', selectedHero: null, gold: 600, level: 1, mouseCoord: '',
   });
   React.useEffect(() => {
     updateUI = setUI;

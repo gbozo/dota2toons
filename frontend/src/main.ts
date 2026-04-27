@@ -4,7 +4,7 @@ import { loadMapData } from './game/mapLoader';
 import { createOrthographicCamera, createGameScene } from './game/engine';
 import { HeroModelLoader } from './game/heroLoader';
 import { MovementSystem, Pathfinding } from './systems/movement';
-import { createPositionComponent, createVelocityComponent, createTeamComponent, createUnitTypeComponent, createHealthComponent, createPathComponent, PositionComponentId, VelocityComponentId, TeamComponentId, UnitTypeComponentId, PathComponentId, type Team } from './components/index';
+import { createPositionComponent, createVelocityComponent, createTeamComponent, createUnitTypeComponent, createHealthComponent, createPathComponent, PositionComponentId, type Team, type PositionComponent } from './components/index';
 import type { MapData } from './types/game';
 import * as THREE from 'three';
 
@@ -84,9 +84,10 @@ class Game {
     this.world.addComponent(entity.id, createPathComponent());
     
     this.heroUnits?.add(heroMesh);
-    this.gameEntities.set(entity.id, { mesh: heroMesh, entity });
+    const gameEntity: GameEntity = { mesh: heroMesh, entity };
+    this.gameEntities.set(entity.id, gameEntity);
     
-    return this.gameEntities.get(entity.id);
+    return gameEntity;
   }
 
   private createHeroLayer(): void {
@@ -223,9 +224,9 @@ class Game {
 
   private syncEntities(): void {
     for (const [id, gameEntity] of this.gameEntities) {
-      const pos = this.world.getComponent(id, PositionComponentId);
+      const pos = this.world.getComponent<PositionComponent>(id, PositionComponentId);
       if (pos) {
-        gameEntity.mesh.position.set(pos.x, pos.z, pos.y);
+        gameEntity.mesh.position.set(pos.x, pos.z ?? 0, pos.y);
       }
     }
   }

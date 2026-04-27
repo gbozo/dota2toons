@@ -147,3 +147,59 @@ export async function loadMapData(
 
   return result;
 }
+
+// ---------------------------------------------------------------------------
+// Object-based blocked cells
+// ---------------------------------------------------------------------------
+
+const GRID   = 64;
+
+function snapToGrid(v: number): number {
+  return Math.round(v / GRID) * GRID;
+}
+
+/**
+ * Returns a set of game-coordinate strings "x,y" that are blocked by
+ * static map objects: trees and buildings.
+ * Pass this to MovementSystem and Pathfinding so heroes can't walk through them.
+ */
+export function buildObjectBlockedSet(mapData: MapData): Set<string> {
+  const blocked = new Set<string>();
+
+  // Each tree occupies one grid cell
+  for (const tree of mapData.trees) {
+    const sx = snapToGrid(tree.x);
+    const sy = snapToGrid(tree.y);
+    blocked.add(`${sx},${sy}`);
+  }
+
+  // Buildings — block the cells under their footprint (use bounds or centre ±1 cell)
+  for (const building of mapData.buildings) {
+    const name = building.name.toLowerCase();
+    // Forts/ancients are large; block a 3×3 footprint
+    const radius = (name.includes('fort') || name.includes('ancient')) ? 2 : 1;
+    const cx = snapToGrid(building.x);
+    const cy = snapToGrid(building.y);
+    for (let dx = -radius; dx <= radius; dx++) {
+      for (let dy = -radius; dy <= radius; dy++) {
+        blocked.add(`${cx + dx * GRID},${cy + dy * GRID}`);
+      }
+    }
+  }
+
+  console.log(`Object blocked cells: ${blocked.size} (trees + buildings)`);
+  return blocked;
+}
+
+/**
+ * Converts the string-key set from buildObjectBlockedSet into the packed-int
+ * format used by MovementSystem / Pathfinding.
+ */
+export function blockedSetToCoords(blocked: Set<string>): Array<{ x: number; y: number }> {
+  const result: Array<{ x: number; y: number }> = [];
+  for (const key of blocked) {
+    const [x, y] = key.split(',').map(Number);
+    result.push({ x, y });
+  }
+  return result;
+}

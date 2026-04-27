@@ -28,7 +28,9 @@ import {
 export class MovementSystem implements System {
   readonly name = 'movement';
 
-  private walkable: Set<number> = new Set();   // packed int keys for O(1) lookup
+  // gridNavData marks BLOCKED (untraversable) cells — walkable = insideMap AND NOT blocked
+  private blocked: Set<number> = new Set();
+  private insideMap: Set<number> = new Set(); // cells with elevation >= 0
   private elevationData: Map<number, number> = new Map();
   private readonly GRID = 64;
   private readonly OFFSET = -10464;
@@ -36,11 +38,18 @@ export class MovementSystem implements System {
 
   constructor(
     gridNavData?: Array<{ x: number; y: number }>,
-    elevationData?: Array<Array<number>>
+    elevationData?: Array<Array<number>>,
+    extraBlocked?: Array<{ x: number; y: number }>
   ) {
     if (gridNavData) {
       for (const p of gridNavData) {
-        this.walkable.add(this.packXY(p.x, p.y));
+        this.blocked.add(this.packXY(p.x, p.y));
+      }
+    }
+    // Extra blocked cells from trees, buildings, etc.
+    if (extraBlocked) {
+      for (const p of extraBlocked) {
+        this.blocked.add(this.packXY(p.x, p.y));
       }
     }
     if (elevationData) {
@@ -66,13 +75,15 @@ export class MovementSystem implements System {
         if (h >= 0) {
           const key = row * this.COLS + col;
           this.elevationData.set(key, h);
+          this.insideMap.add(key);
         }
       }
     }
   }
 
   isWalkable(x: number, y: number): boolean {
-    return this.walkable.has(this.packXY(this.snapToGrid(x), this.snapToGrid(y)));
+    const key = this.packXY(this.snapToGrid(x), this.snapToGrid(y));
+    return this.insideMap.has(key) && !this.blocked.has(key);
   }
 
   getElevation(x: number, y: number): number {
@@ -96,37 +107,44 @@ export class MovementSystem implements System {
       if (!pos || !vel) continue;
 
       if (path && path.waypoints.length > 0 && !path.reachedTarget) {
-        const wp = path.waypoints[path.currentWaypointIndex];
-        const dx = wp.x - pos.x;
-        const dy = wp.y - pos.y;
-        const dist = Math.sqrt(dx * dx + dy * dy);
-
         // Speed in world units/second — heroes are 300 u/s per SPEC
         const speed = 300;
-        const step  = speed * dtSec;
+        let remaining = speed * dtSec; // budget for this tick
 
-        if (dist <= step) {
-          // Snap to waypoint
-          pos.x = wp.x;
-          pos.y = wp.y;
-          pos.z = this.getElevation(wp.x, wp.y);
+        // Consume budget across multiple waypoints in a single tick
+        while (remaining > 0 && path.currentWaypointIndex < path.waypoints.length) {
+          const wp = path.waypoints[path.currentWaypointIndex];
+          const dx = wp.x - pos.x;
+          const dy = wp.y - pos.y;
+          const dist = Math.sqrt(dx * dx + dy * dy);
 
-          if (path.currentWaypointIndex < path.waypoints.length - 1) {
-            path.currentWaypointIndex++;
+          if (dist <= remaining) {
+            // Reach this waypoint — update facing toward it before snapping
+            if (dist > 0.001 && utype) pos.rotation = Math.atan2(dy / dist, dx / dist);
+            pos.x = wp.x;
+            pos.y = wp.y;
+            pos.z = this.getElevation(wp.x, wp.y);
+            remaining -= dist;
+
+            if (path.currentWaypointIndex < path.waypoints.length - 1) {
+              path.currentWaypointIndex++;
+            } else {
+              path.reachedTarget = true;
+              vel.dx = 0;
+              vel.dy = 0;
+              break;
+            }
           } else {
-            path.reachedTarget = true;
-            vel.dx = 0;
-            vel.dy = 0;
+            const nx = dx / dist;
+            const ny = dy / dist;
+            pos.x += nx * remaining;
+            pos.y += ny * remaining;
+            pos.z  = this.getElevation(pos.x, pos.y);
+            if (utype) pos.rotation = Math.atan2(ny, nx);
+            vel.dx = nx * speed;
+            vel.dy = ny * speed;
+            remaining = 0;
           }
-        } else {
-          const nx = dx / dist;
-          const ny = dy / dist;
-          pos.x += nx * step;
-          pos.y += ny * step;
-          pos.z  = this.getElevation(pos.x, pos.y);
-          if (utype) pos.rotation = Math.atan2(ny, nx);
-          vel.dx = nx * speed;
-          vel.dy = ny * speed;
         }
       } else if (vel.dx !== 0 || vel.dy !== 0) {
         // Velocity-driven (no path)
@@ -209,17 +227,39 @@ class MinHeap {
 const SQRT2 = Math.SQRT2;
 
 export class Pathfinding {
-  private walkable: Set<number>;
+  // gridNavData marks BLOCKED cells — walkable = insideMap AND NOT blocked
+  private blocked: Set<number>;
+  private insideMap: Set<number>;
   private readonly GRID = 64;
   private readonly OFFSET = -10464;
   private readonly COLS = 327;
   private readonly ROWS = 327;
 
-  constructor(gridNavData?: Array<{ x: number; y: number }>) {
-    this.walkable = new Set();
+  constructor(
+    gridNavData?: Array<{ x: number; y: number }>,
+    elevationData?: Array<Array<number>>,
+    extraBlocked?: Array<{ x: number; y: number }>
+  ) {
+    this.blocked  = new Set();
+    this.insideMap = new Set();
     if (gridNavData) {
       for (const p of gridNavData) {
-        this.walkable.add(this.packXY(p.x, p.y));
+        this.blocked.add(this.packXY(p.x, p.y));
+      }
+    }
+    // Extra blocked cells from trees, buildings, etc.
+    if (extraBlocked) {
+      for (const p of extraBlocked) {
+        this.blocked.add(this.packXY(p.x, p.y));
+      }
+    }
+    if (elevationData) {
+      for (let row = 0; row < elevationData.length; row++) {
+        for (let col = 0; col < elevationData[row].length; col++) {
+          if (elevationData[row][col] >= 0) {
+            this.insideMap.add(row * this.COLS + col);
+          }
+        }
       }
     }
   }
@@ -240,7 +280,8 @@ export class Pathfinding {
 
   private walkableAt(col: number, row: number): boolean {
     if (col < 0 || col >= this.COLS || row < 0 || row >= this.ROWS) return false;
-    return this.walkable.has(row * this.COLS + col);
+    const key = row * this.COLS + col;
+    return this.insideMap.has(key) && !this.blocked.has(key);
   }
 
   // Octile heuristic — exact for 8-dir grids (admissible + consistent)

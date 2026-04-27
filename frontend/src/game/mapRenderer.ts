@@ -237,3 +237,79 @@ export function updateFrustumCulling(
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Walkable cell debug overlay — InstancedMesh, one quad per walkable cell
+// ---------------------------------------------------------------------------
+
+export function createWalkableMesh(
+  gridNav: Array<{ x: number; y: number }>,
+  elevation: number[][],
+  extraBlocked?: Array<{ x: number; y: number }>
+): THREE.InstancedMesh {
+  const GRID   = GRID_CELL_SIZE;
+  const OFFSET = MAP_OFFSET;
+  const COLS   = 327;
+  const ROWS   = 327;
+
+  // gridNav marks BLOCKED cells — build set of blocked keys
+  const blocked = new Set<number>();
+  for (const p of gridNav) {
+    const col = Math.round((p.x - OFFSET) / GRID);
+    const row = Math.round((p.y - OFFSET) / GRID);
+    blocked.add(row * COLS + col);
+  }
+  // Also block trees, buildings, etc.
+  if (extraBlocked) {
+    for (const p of extraBlocked) {
+      const col = Math.round((p.x - OFFSET) / GRID);
+      const row = Math.round((p.y - OFFSET) / GRID);
+      blocked.add(row * COLS + col);
+    }
+  }
+
+  // Collect walkable cells: inside map (elev >= 0) AND not blocked
+  const walkableCells: Array<{ x: number; y: number; elev: number }> = [];
+  for (let row = 0; row < ROWS; row++) {
+    for (let col = 0; col < COLS; col++) {
+      const v = elevation[row]?.[col];
+      if (v == null || v < 0) continue;
+      const key = row * COLS + col;
+      if (blocked.has(key)) continue;
+      const gx = OFFSET + col * GRID;
+      const gy = OFFSET + row * GRID;
+      walkableCells.push({ x: gx, y: gy, elev: v });
+    }
+  }
+
+  const count = walkableCells.length;
+
+  const geo = new THREE.PlaneGeometry(GRID - 4, GRID - 4);
+  const mat = new THREE.MeshBasicMaterial({
+    color: 0xffdd00,
+    transparent: true,
+    opacity: 0.15,
+    depthWrite: false,
+    depthTest: false,
+    side: THREE.DoubleSide,
+  });
+
+  const mesh = new THREE.InstancedMesh(geo, mat, count);
+  mesh.name = 'walkable_debug';
+  mesh.renderOrder = 1;
+
+  const matrix = new THREE.Matrix4();
+  const pos    = new THREE.Vector3();
+  const quat   = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2);
+  const scale  = new THREE.Vector3(1, 1, 1);
+
+  for (let i = 0; i < count; i++) {
+    const { x, y, elev } = walkableCells[i];
+    pos.set(x, elev * ELEVATION_SCALE + 40, -y);
+    matrix.compose(pos, quat, scale);
+    mesh.setMatrixAt(i, matrix);
+  }
+
+  mesh.instanceMatrix.needsUpdate = true;
+  return mesh;
+}

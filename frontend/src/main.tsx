@@ -4,9 +4,9 @@ import { createRoot } from 'react-dom/client';
 import * as THREE from 'three';
 
 import { createWorld } from './ecs/world';
-import { loadMapData } from './game/mapLoader';
+import { loadMapData, buildObjectBlockedSet, blockedSetToCoords } from './game/mapLoader';
 import { createPerspectiveCamera, createGameScene } from './game/engine';
-import { createTerrain, createTreeInstances, createBuildingMeshes } from './game/mapRenderer';
+import { createTerrain, createTreeInstances, createBuildingMeshes, createWalkableMesh } from './game/mapRenderer';
 import { CameraController } from './game/camera';
 import { HeroModelLoader } from './game/heroLoader';
 import type { HeroInstance } from './game/heroLoader';
@@ -157,6 +157,9 @@ class Game {
   private selectedId: string | null = null;
   private localHeroId: string | null = null;
 
+  // Smoothed render rotation per entity (interpolated toward pos.rotation each frame)
+  private renderRotation = new Map<string, number>();
+
   private rafId       = 0;
   private lastFrame   = 0;
   private accumulator = 0;
@@ -179,8 +182,11 @@ class Game {
     this.status('Loading map data...');
     this.mapData = await loadMapData('/mapdata');
 
-    this.movementSystem = new MovementSystem(this.mapData.gridNav, this.mapData.elevation);
-    this.pathfinding    = new Pathfinding(this.mapData.gridNav);
+    // Build extra blocked cells from static map objects (trees, buildings)
+    const objectBlocked = blockedSetToCoords(buildObjectBlockedSet(this.mapData));
+
+    this.movementSystem = new MovementSystem(this.mapData.gridNav, this.mapData.elevation, objectBlocked);
+    this.pathfinding    = new Pathfinding(this.mapData.gridNav, this.mapData.elevation, objectBlocked);
     this.world.registerSystem(this.movementSystem);
     this.world.registerSystem(this.animSystem);
 
@@ -219,6 +225,9 @@ class Game {
 
     // Debug grid + labels
     this.scene.add(createDebugGrid());
+
+    // Walkable cell overlay (debug)
+    this.scene.add(createWalkableMesh(this.mapData.gridNav, this.mapData.elevation, objectBlocked));
 
     // Hero group
     this.heroGroup = new THREE.Group();
@@ -266,13 +275,11 @@ class Game {
       onHold:    ()     => this.handleStop(),
     });
 
-    // Spawn heroes at real fountain positions
+    // Spawn heroes at nearest walkable cells to each fountain
     this.status('Spawning heroes...');
     await Promise.all([
-      // Radiant fountain: (-7456, -6938) in game coords = Three.js (-7456, z, -6938)
-      this.spawnHero('axe',   'radiant', -7456 + 640, -6938, true),
-      // Dire fountain: (7408, 6848)
-      this.spawnHero('pudge', 'dire',     7408,  6848, false),
+      this.spawnHero('axe',   'radiant', -7328, -6810, true),   // nearest walkable to Radiant fountain
+      this.spawnHero('pudge', 'dire',     7152,  6720, false),   // nearest walkable to Dire fountain
     ]);
 
     // Start centered on full map so both heroes are visible
@@ -335,6 +342,7 @@ class Game {
       instance: fallback, selectionRing: selRing, label,
     };
     this.entities.set(entity.id, rec);
+    this.renderRotation.set(entity.id, initialRotation); // start facing the right way
     this.inputMgr!.registerMesh(entity.id, fallback.root);
     this.animSystem.register(entity.id, fallback);
     if (isLocal && !this.localHeroId) this.localHeroId = entity.id;
@@ -428,36 +436,39 @@ class Game {
       this.animSystem.updateMixers(dtSec);
       this.inputMgr?.update(frame);
 
-      this.syncMeshes();
+      this.syncMeshes(dtSec);
       this.renderer?.render(this.scene!, this.camera!);
       this.rafId = requestAnimationFrame(loop);
     };
     this.rafId = requestAnimationFrame(loop);
   }
 
-  private syncFrame = 0;
-  private syncMeshes(): void {
-    this.syncFrame++;
+  // Rotation turn speed: radians per second
+  private readonly TURN_SPEED = Math.PI * 3; // 540°/s — snappy but not instant
+
+  private syncMeshes(dtSec: number): void {
     for (const [id, rec] of this.entities) {
       const pos = this.world.getComponent<PositionComponent>(id, PositionComponentId);
       if (!pos) continue;
       const worldY = pos.z * ELEVATION_SCALE;
       rec.instance.root.position.set(pos.x, worldY, -pos.y);
-      rec.instance.root.rotation.y = -pos.rotation;
-      rec.label.position.set(pos.x, worldY + 350, -pos.y);
 
-      // Debug: log once per second for axe
-      if (rec.heroKey === 'axe' && this.syncFrame % 60 === 0) {
-        const wp = rec.instance.root.position;
-        const wmat = new THREE.Vector3();
-        rec.instance.root.getWorldPosition(wmat);
-        console.log(
-          `[sync] axe ECS=(${pos.x.toFixed(0)},${pos.y.toFixed(0)},${pos.z})` +
-          ` root.pos=(${wp.x.toFixed(0)},${wp.y.toFixed(0)},${wp.z.toFixed(0)})` +
-          ` world=(${wmat.x.toFixed(0)},${wmat.y.toFixed(0)},${wmat.z.toFixed(0)})` +
-          ` instance=${rec.instance === rec.instance ? rec.heroKey : '?'} isFallback=${!rec.instance.mixer}`
-        );
-      }
+      // Smooth rotation — lerp current render angle toward ECS target angle
+      // using shortest angular path to avoid spinning the long way round
+      const targetAngle = pos.rotation;
+      let current = this.renderRotation.get(id) ?? targetAngle;
+
+      // Wrap delta to [-PI, PI]
+      let delta = targetAngle - current;
+      while (delta >  Math.PI) delta -= 2 * Math.PI;
+      while (delta < -Math.PI) delta += 2 * Math.PI;
+
+      const maxStep = this.TURN_SPEED * dtSec;
+      current += Math.sign(delta) * Math.min(Math.abs(delta), maxStep);
+      this.renderRotation.set(id, current);
+
+      rec.instance.root.rotation.y = Math.atan2(-Math.cos(current), Math.sin(current));
+      rec.label.position.set(pos.x, worldY + 350, -pos.y);
     }
   }
 

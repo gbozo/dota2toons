@@ -1,143 +1,42 @@
 import * as THREE from 'three';
 
-export type TickCallback = (dt: number, tick: number) => void;
+// ---------------------------------------------------------------------------
+// Perspective camera — simple top-down view
+// ---------------------------------------------------------------------------
 
-export interface GameEngineConfig {
-  tickRate: number;
-  interpolate?: boolean;
-}
-
-export function useGameEngine(config: GameEngineConfig = { tickRate: 30 }) {
-  let runningRef = false;
-  let lastTimeRef = 0;
-  const callbacksRef: TickCallback[] = [];
-  let frameRef: number | null = null;
-  let tickRef = 0;
-
-  const registerTickCallback = (callback: TickCallback) => {
-    callbacksRef.push(callback);
-    return () => {
-      const index = callbacksRef.indexOf(callback);
-      if (index !== -1) {
-        callbacksRef.splice(index, 1);
-      }
-    };
-  };
-
-  const start = () => {
-    if (runningRef) return;
-    runningRef = true;
-    lastTimeRef = performance.now();
-    
-    const tickInterval = 1000 / config.tickRate;
-    
-    const loop = () => {
-      if (!runningRef) return;
-      
-      const now = performance.now();
-      const elapsed = now - lastTimeRef;
-      
-      if (elapsed >= tickInterval) {
-        const dt = elapsed;
-        lastTimeRef = now - (elapsed % tickInterval);
-        
-        for (const callback of callbacksRef) {
-          callback(dt, tickRef + 1);
-        }
-        
-        tickRef++;
-      }
-      
-      frameRef = requestAnimationFrame(loop);
-    };
-    
-    frameRef = requestAnimationFrame(loop);
-  };
-
-  const stop = () => {
-    runningRef = false;
-    if (frameRef) {
-      cancelAnimationFrame(frameRef);
-      frameRef = null;
-    }
-  };
-
-  return {
-    tick: tickRef,
-    start,
-    stop,
-    running: runningRef,
-    registerTickCallback,
-  };
-}
-
-export interface CameraConfig {
-  frustumSize: number;
+export interface PerspectiveCameraConfig {
+  fov?: number;       // degrees (default 50)
   aspect: number;
-  near: number;
-  far: number;
-  rotation: number;
-  tilt: number;
+  near?: number;
+  far?: number;
 }
 
-export function createOrthographicCamera(config: CameraConfig): THREE.OrthographicCamera {
-  const { 
-    frustumSize = 2048, 
-    aspect = 16 / 9, 
-    near = -10000, 
-    far = 10000,
-    rotation = 45,
-    tilt = 45
-  } = config;
+/**
+ * Creates a perspective camera looking straight down at the map centre.
+ * Height is set so the full map (20928 units wide) fits in view at default zoom.
+ */
+export function createPerspectiveCamera(cfg: PerspectiveCameraConfig): THREE.PerspectiveCamera {
+  const fov    = cfg.fov  ?? 50;
+  const near   = cfg.near ?? 100;
+  const far    = cfg.far  ?? 80000;
 
-  const camera = new THREE.OrthographicCamera(
-    -frustumSize * aspect / 2,
-    frustumSize * aspect / 2,
-    frustumSize / 2,
-    -frustumSize / 2,
-    near,
-    far
-  );
+  const camera = new THREE.PerspectiveCamera(fov, cfg.aspect, near, far);
 
-  const rotationRad = (rotation * Math.PI) / 180;
-  const tiltRad = (tilt * Math.PI) / 180;
-  
-  const distance = frustumSize * 1.5;
-  camera.position.set(
-    distance * Math.sin(rotationRad) * Math.cos(tiltRad),
-    distance * Math.sin(tiltRad),
-    distance * Math.cos(rotationRad) * Math.cos(tiltRad)
-  );
+  // Height to see the full 20928-unit map width at fov=50:
+  //   half_width = 10464,  half_fov = 25 deg
+  //   height = half_width / tan(half_fov) ≈ 10464 / 0.466 ≈ 22470
+  // Start at 60 % of that for a comfortable initial zoom.
+  const height = 14000;
+  camera.position.set(0, height, 0);
+  camera.up.set(0, 0, -1); // screen-right = +X, screen-up = -Z → game Y=-6938 (Radiant) maps to Three Z=+6938 = bottom
   camera.lookAt(0, 0, 0);
 
   return camera;
 }
 
-export interface RendererConfig {
-  width: number;
-  height: number;
-  antialias?: boolean;
-}
-
-export function createRenderer(
-  canvas: HTMLCanvasElement,
-  config: RendererConfig
-): THREE.WebGLRenderer {
-  const { width, height, antialias = true } = config;
-  
-  const renderer = new THREE.WebGLRenderer({
-    canvas,
-    antialias,
-    alpha: true,
-  });
-  
-  renderer.setSize(width, height);
-  renderer.setPixelRatio(window.devicePixelRatio);
-  renderer.shadowMap.enabled = true;
-  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-  
-  return renderer;
-}
+// ---------------------------------------------------------------------------
+// Scene
+// ---------------------------------------------------------------------------
 
 export interface SceneConfig {
   ambientLight?: number;
@@ -148,24 +47,12 @@ export function createGameScene(config: SceneConfig = {}): THREE.Scene {
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x1a1a2e);
 
-  const ambientLight = new THREE.AmbientLight(0xffffff, config.ambientLight ?? 0.4);
-  scene.add(ambientLight);
+  scene.add(new THREE.AmbientLight(0xffffff, config.ambientLight ?? 0.6));
 
-  const directionalLight = new THREE.DirectionalLight(0xffffff, config.directionalLight ?? 0.8);
-  directionalLight.position.set(1000, 2000, 1000);
-  directionalLight.castShadow = true;
-  
-  const shadowSize = 4096;
-  directionalLight.shadow.mapSize.width = shadowSize;
-  directionalLight.shadow.mapSize.height = shadowSize;
-  directionalLight.shadow.camera.near = 0.5;
-  directionalLight.shadow.camera.far = 5000;
-  directionalLight.shadow.camera.left = -2000;
-  directionalLight.shadow.camera.right = 2000;
-  directionalLight.shadow.camera.top = 2000;
-  directionalLight.shadow.camera.bottom = -2000;
-  
-  scene.add(directionalLight);
+  const dir = new THREE.DirectionalLight(0xffffff, config.directionalLight ?? 0.8);
+  dir.position.set(5000, 8000, 5000);
+  dir.castShadow = false;
+  scene.add(dir);
 
   return scene;
 }

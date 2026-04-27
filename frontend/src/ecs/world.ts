@@ -19,21 +19,21 @@ export interface System {
 
 export interface World {
   entities: Map<EntityID, Entity>;
-  tick: number;
-  deltaTime: number;
-  
+  readonly tick: number;
+  readonly deltaTime: number;
+
   createEntity(id?: EntityID): Entity;
   destroyEntity(id: EntityID): void;
   getEntity(id: EntityID): Entity | undefined;
-  
+
   addComponent<T extends Component>(entityId: EntityID, component: T): void;
   removeComponent(entityId: EntityID, componentId: string): void;
   getComponent<T extends Component>(entityId: EntityID, componentId: string): T | undefined;
   hasComponent(entityId: EntityID, componentId: string): boolean;
-  
+
   registerSystem(system: System): void;
   unregisterSystem(systemName: string): void;
-  
+
   update(dt: number): void;
 }
 
@@ -42,19 +42,25 @@ export function createWorld(): World {
   const systems: System[] = [];
   let currentTick = 0;
   let currentDeltaTime = 0;
-  
+
   const entityCounter = { count: 0 };
-  
+
   const generateId = (): EntityID => {
     entityCounter.count++;
     return `entity_${entityCounter.count}`;
   };
-  
-  return {
+
+  const world: World = {
     entities,
-    tick: currentTick,
-    deltaTime: currentDeltaTime,
-    
+
+    get tick(): number {
+      return currentTick;
+    },
+
+    get deltaTime(): number {
+      return currentDeltaTime;
+    },
+
     createEntity(id?: EntityID): Entity {
       const entity: Entity = {
         id: id || generateId(),
@@ -64,29 +70,29 @@ export function createWorld(): World {
       entities.set(entity.id, entity);
       return entity;
     },
-    
+
     destroyEntity(id: EntityID): void {
       entities.delete(id);
     },
-    
+
     getEntity(id: EntityID): Entity | undefined {
       return entities.get(id);
     },
-    
+
     addComponent<T extends Component>(entityId: EntityID, component: T): void {
       const entity = entities.get(entityId);
       if (entity) {
         entity.components.set(component.componentId, component);
       }
     },
-    
+
     removeComponent(entityId: EntityID, componentId: string): void {
       const entity = entities.get(entityId);
       if (entity) {
         entity.components.delete(componentId);
       }
     },
-    
+
     getComponent<T extends Component>(entityId: EntityID, componentId: string): T | undefined {
       const entity = entities.get(entityId);
       if (entity) {
@@ -94,7 +100,7 @@ export function createWorld(): World {
       }
       return undefined;
     },
-    
+
     hasComponent(entityId: EntityID, componentId: string): boolean {
       const entity = entities.get(entityId);
       if (entity) {
@@ -102,25 +108,27 @@ export function createWorld(): World {
       }
       return false;
     },
-    
+
     registerSystem(system: System): void {
       systems.push(system);
     },
-    
+
     unregisterSystem(systemName: string): void {
-      const index = systems.findIndex(s => s.name === systemName);
+      const index = systems.findIndex((s) => s.name === systemName);
       if (index !== -1) {
         systems.splice(index, 1);
       }
     },
-    
+
     update(dt: number): void {
       currentTick++;
       currentDeltaTime = dt;
-      
+
       for (const system of systems) {
-        system.update(dt, this);
+        system.update(dt, world);
       }
     },
   };
+
+  return world;
 }

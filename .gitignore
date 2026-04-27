@@ -1,0 +1,15 @@
+# Root
+node_modules/
+dist/
+
+# Go build artifacts
+server
+*.exe
+*.test
+
+# Map data (sourced from submodule — keep copies gitignored, submodule ref is tracked)
+mapdata/data/
+
+# Frontend build output
+frontend/dist/
+frontend/node_modules/

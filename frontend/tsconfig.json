@@ -3,6 +3,7 @@
     "target": "es2023",
     "module": "esnext",
     "lib": ["ES2023", "DOM"],
+    "jsx": "react-jsx",
     "types": ["vite/client", "three"],
     "skipLibCheck": true,
 
@@ -14,6 +15,7 @@
     "noEmit": true,
 
     /* Linting */
+    "strict": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "erasableSyntaxOnly": true,

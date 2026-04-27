@@ -1,0 +1,3 @@
+[submodule "mapdata/leamare"]
+	path = mapdata/leamare
+	url = https://github.com/leamare/dota-map-coordinates.git

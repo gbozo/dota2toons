@@ -1,3 +1,14 @@
+/**
+ * systems/movement.ts
+ *
+ * MovementSystem  — ECS system that advances entities along their PathComponent
+ *                   waypoints each tick at the correct hero/creep speed.
+ *
+ * Pathfinding     — A* with binary min-heap open set, 8-directional movement,
+ *                   diagonal corner-cutting guard, and straight-line path
+ *                   smoothing (string-pulling).
+ */
+
 import type { World, System } from '../ecs/world';
 import {
   PositionComponentId,
@@ -10,19 +21,26 @@ import {
   type UnitTypeComponent,
 } from '../components/index';
 
+// ---------------------------------------------------------------------------
+// MovementSystem
+// ---------------------------------------------------------------------------
+
 export class MovementSystem implements System {
   readonly name = 'movement';
 
-  private gridNavData: Set<string> = new Set();
-  private elevationData: Map<string, number> = new Map();
+  private walkable: Set<number> = new Set();   // packed int keys for O(1) lookup
+  private elevationData: Map<number, number> = new Map();
+  private readonly GRID = 64;
+  private readonly OFFSET = -10464;
+  private readonly COLS = 327;
 
   constructor(
     gridNavData?: Array<{ x: number; y: number }>,
     elevationData?: Array<Array<number>>
   ) {
     if (gridNavData) {
-      for (const point of gridNavData) {
-        this.gridNavData.add(`${point.x},${point.y}`);
+      for (const p of gridNavData) {
+        this.walkable.add(this.packXY(p.x, p.y));
       }
     }
     if (elevationData) {
@@ -30,205 +48,369 @@ export class MovementSystem implements System {
     }
   }
 
-  private parseElevation(data: Array<Array<number>>): void {
-    const gridSize = 64;
-    const offset = -10432;
+  private packXY(x: number, y: number): number {
+    // Shift to non-negative grid indices then pack into a single integer
+    const col = Math.round((x - this.OFFSET) / this.GRID);
+    const row = Math.round((y - this.OFFSET) / this.GRID);
+    return row * this.COLS + col;
+  }
+
+  private snapToGrid(v: number): number {
+    return Math.round(v / this.GRID) * this.GRID;
+  }
+
+  private parseElevation(data: number[][]): void {
     for (let row = 0; row < data.length; row++) {
       for (let col = 0; col < data[row].length; col++) {
-        const height = data[row][col];
-        if (height >= 0) {
-          const x = offset + col * gridSize;
-          const y = offset + row * gridSize;
-          this.elevationData.set(`${x},${y}`, height);
+        const h = data[row][col];
+        if (h >= 0) {
+          const key = row * this.COLS + col;
+          this.elevationData.set(key, h);
         }
       }
     }
   }
 
   isWalkable(x: number, y: number): boolean {
-    return this.gridNavData.has(`${Math.floor(x / 64) * 64},${Math.floor(y / 64) * 64}`);
+    return this.walkable.has(this.packXY(this.snapToGrid(x), this.snapToGrid(y)));
   }
 
   getElevation(x: number, y: number): number {
-    return this.elevationData.get(`${Math.floor(x / 64) * 64},${Math.floor(y / 64) * 64}`) || 0;
+    // Original (unrotated) lookup — terrain mesh rotation is visual only.
+    const col = Math.round((this.snapToGrid(x) - this.OFFSET) / this.GRID);
+    const row = Math.round((this.snapToGrid(y) - this.OFFSET) / this.GRID);
+    return this.elevationData.get(row * this.COLS + col) ?? 0;
   }
 
   update(dt: number, world: World): void {
-    const entities = Array.from(world.entities.values());
-    
-    for (const entity of entities) {
+    const dtSec = dt / 1000;
+
+    for (const entity of world.entities.values()) {
       if (!entity.active) continue;
-      
-      const position = world.getComponent<PositionComponent>(entity.id, PositionComponentId);
-      const velocity = world.getComponent<VelocityComponent>(entity.id, VelocityComponentId);
-      const path = world.getComponent<PathComponent>(entity.id, PathComponentId);
-      const unitType = world.getComponent<UnitTypeComponent>(entity.id, UnitTypeComponentId);
-      
-      if (!position || !velocity) continue;
-      
-      const dtSeconds = dt / 1000;
-      
+
+      const pos    = world.getComponent<PositionComponent>(entity.id, PositionComponentId);
+      const vel    = world.getComponent<VelocityComponent>(entity.id, VelocityComponentId);
+      const path   = world.getComponent<PathComponent>(entity.id, PathComponentId);
+      const utype  = world.getComponent<UnitTypeComponent>(entity.id, UnitTypeComponentId);
+
+      if (!pos || !vel) continue;
+
       if (path && path.waypoints.length > 0 && !path.reachedTarget) {
-        const target = path.waypoints[path.currentWaypointIndex];
-        const dx = target.x - position.x;
-        const dy = target.y - position.y;
-        const distance = Math.sqrt(dx * dx + dy * dy);
-        
-        const speed = 150;
-        const moveSpeed = speed * dtSeconds;
-        
-        if (distance < moveSpeed) {
-          position.x = target.x;
-          position.y = target.y;
-          position.z = this.getElevation(target.x, target.y);
-          
+        const wp = path.waypoints[path.currentWaypointIndex];
+        const dx = wp.x - pos.x;
+        const dy = wp.y - pos.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+
+        // Speed in world units/second — heroes are 300 u/s per SPEC
+        const speed = 300;
+        const step  = speed * dtSec;
+
+        if (dist <= step) {
+          // Snap to waypoint
+          pos.x = wp.x;
+          pos.y = wp.y;
+          pos.z = this.getElevation(wp.x, wp.y);
+
           if (path.currentWaypointIndex < path.waypoints.length - 1) {
             path.currentWaypointIndex++;
           } else {
             path.reachedTarget = true;
+            vel.dx = 0;
+            vel.dy = 0;
           }
         } else {
-          position.x += (dx / distance) * moveSpeed;
-          position.y += (dy / distance) * moveSpeed;
-          position.z = this.getElevation(position.x, position.y);
-          
-          if (unitType) {
-            position.rotation = Math.atan2(dy, dx);
-          }
+          const nx = dx / dist;
+          const ny = dy / dist;
+          pos.x += nx * step;
+          pos.y += ny * step;
+          pos.z  = this.getElevation(pos.x, pos.y);
+          if (utype) pos.rotation = Math.atan2(ny, nx);
+          vel.dx = nx * speed;
+          vel.dy = ny * speed;
         }
-      } else if (velocity.dx !== 0 || velocity.dy !== 0) {
-        const newX = position.x + velocity.dx * dtSeconds;
-        const newY = position.y + velocity.dy * dtSeconds;
-        
-        if (this.isWalkable(newX, newY)) {
-          position.x = newX;
-          position.y = newY;
-          position.z = this.getElevation(newX, newY);
+      } else if (vel.dx !== 0 || vel.dy !== 0) {
+        // Velocity-driven (no path)
+        const nx = pos.x + vel.dx * dtSec;
+        const ny = pos.y + vel.dy * dtSec;
+        if (this.isWalkable(nx, ny)) {
+          pos.x = nx;
+          pos.y = ny;
+          pos.z = this.getElevation(nx, ny);
         }
-        
-        if (unitType) {
-          position.rotation = Math.atan2(velocity.dy, velocity.dx);
-        }
-        
-        velocity.dx = 0;
-        velocity.dy = 0;
+        if (utype) pos.rotation = Math.atan2(vel.dy, vel.dx);
+        vel.dx = 0;
+        vel.dy = 0;
       }
     }
   }
 }
 
+// ---------------------------------------------------------------------------
+// Binary min-heap for A* open set
+// ---------------------------------------------------------------------------
+
+interface HeapNode {
+  x: number;
+  y: number;
+  g: number;
+  h: number;
+  f: number;
+  parent: HeapNode | null;
+}
+
+class MinHeap {
+  private data: HeapNode[] = [];
+
+  get size(): number { return this.data.length; }
+
+  push(node: HeapNode): void {
+    this.data.push(node);
+    this.bubbleUp(this.data.length - 1);
+  }
+
+  pop(): HeapNode {
+    const top = this.data[0];
+    const last = this.data.pop()!;
+    if (this.data.length > 0) {
+      this.data[0] = last;
+      this.sinkDown(0);
+    }
+    return top;
+  }
+
+  private bubbleUp(i: number): void {
+    while (i > 0) {
+      const parent = (i - 1) >> 1;
+      if (this.data[parent].f <= this.data[i].f) break;
+      [this.data[parent], this.data[i]] = [this.data[i], this.data[parent]];
+      i = parent;
+    }
+  }
+
+  private sinkDown(i: number): void {
+    const n = this.data.length;
+    while (true) {
+      let smallest = i;
+      const l = 2 * i + 1;
+      const r = 2 * i + 2;
+      if (l < n && this.data[l].f < this.data[smallest].f) smallest = l;
+      if (r < n && this.data[r].f < this.data[smallest].f) smallest = r;
+      if (smallest === i) break;
+      [this.data[smallest], this.data[i]] = [this.data[i], this.data[smallest]];
+      i = smallest;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pathfinding — A* with binary heap + 8-dir + path smoothing
+// ---------------------------------------------------------------------------
+
+const SQRT2 = Math.SQRT2;
+
 export class Pathfinding {
-  private gridNavData: Set<string> = new Set();
-  private gridSize = 64;
+  private walkable: Set<number>;
+  private readonly GRID = 64;
+  private readonly OFFSET = -10464;
+  private readonly COLS = 327;
+  private readonly ROWS = 327;
 
   constructor(gridNavData?: Array<{ x: number; y: number }>) {
+    this.walkable = new Set();
     if (gridNavData) {
-      for (const point of gridNavData) {
-        this.gridNavData.add(`${point.x},${point.y}`);
+      for (const p of gridNavData) {
+        this.walkable.add(this.packXY(p.x, p.y));
       }
     }
+  }
+
+  private packXY(x: number, y: number): number {
+    const col = Math.round((x - this.OFFSET) / this.GRID);
+    const row = Math.round((y - this.OFFSET) / this.GRID);
+    return row * this.COLS + col;
+  }
+
+  private toGrid(world: number): number {
+    return Math.round((world - this.OFFSET) / this.GRID);
+  }
+
+  private toWorld(grid: number): number {
+    return this.OFFSET + grid * this.GRID;
+  }
+
+  private walkableAt(col: number, row: number): boolean {
+    if (col < 0 || col >= this.COLS || row < 0 || row >= this.ROWS) return false;
+    return this.walkable.has(row * this.COLS + col);
+  }
+
+  // Octile heuristic — exact for 8-dir grids (admissible + consistent)
+  private heuristic(ac: number, ar: number, bc: number, br: number): number {
+    const dc = Math.abs(ac - bc);
+    const dr = Math.abs(ar - br);
+    return this.GRID * (dc + dr + (SQRT2 - 2) * Math.min(dc, dr));
   }
 
   findPath(
-    startX: number,
-    startY: number,
-    endX: number,
-    endY: number
+    startX: number, startY: number,
+    endX:   number, endY:   number
   ): Array<{ x: number; y: number }> {
-    const endKey = `${Math.floor(endX / this.gridSize) * this.gridSize},${Math.floor(endY / this.gridSize) * this.gridSize}`;
-    
-    if (!this.gridNavData.has(endKey)) {
-      return [];
+    const sc = this.toGrid(startX);
+    const sr = this.toGrid(startY);
+    const ec = this.toGrid(endX);
+    const er = this.toGrid(endY);
+
+    // If target is not walkable, find the nearest walkable cell
+    let tc = ec;
+    let tr = er;
+    if (!this.walkableAt(tc, tr)) {
+      const nearest = this.nearestWalkable(ec, er);
+      if (!nearest) return [];
+      tc = nearest.c;
+      tr = nearest.r;
     }
-    
-    const startNode = this.getGridCoord(startX, startY);
-    const endNode = this.getGridCoord(endX, endY);
-    
-    const openSet: Array<{ x: number; y: number; g: number; h: number; parent?: { x: number; y: number } }> = [];
-    const closedSet = new Set<string>();
-    
-    openSet.push({ x: startNode.x, y: startNode.y, g: 0, h: this.heuristic(startNode, endNode) });
-    
-    while (openSet.length > 0) {
-      openSet.sort((a, b) => (a.g + a.h) - (b.g + b.h));
-      const current = openSet.shift()!;
-      const currentKey = `${current.x},${current.y}`;
-      
-      if (currentKey === endKey) {
-        return this.reconstructPath(current);
+
+    if (sc === tc && sr === tr) return [{ x: startX, y: startY }];
+
+    const openSet   = new MinHeap();
+    const closedSet = new Set<number>();
+    // Best g-cost seen for each cell (for duplicate detection in open set)
+    const bestG     = new Map<number, number>();
+
+    const startNode: HeapNode = {
+      x: sc, y: sr, g: 0,
+      h: this.heuristic(sc, sr, tc, tr),
+      f: 0,
+      parent: null,
+    };
+    startNode.f = startNode.g + startNode.h;
+    openSet.push(startNode);
+    bestG.set(sr * this.COLS + sc, 0);
+
+    // 8-directional neighbours: [dc, dr, cost]
+    const DIRS: [number, number, number][] = [
+      [ 1,  0, this.GRID],
+      [-1,  0, this.GRID],
+      [ 0,  1, this.GRID],
+      [ 0, -1, this.GRID],
+      [ 1,  1, this.GRID * SQRT2],
+      [ 1, -1, this.GRID * SQRT2],
+      [-1,  1, this.GRID * SQRT2],
+      [-1, -1, this.GRID * SQRT2],
+    ];
+
+    while (openSet.size > 0) {
+      const cur = openSet.pop();
+      const key = cur.y * this.COLS + cur.x;
+
+      if (closedSet.has(key)) continue;
+      closedSet.add(key);
+
+      if (cur.x === tc && cur.y === tr) {
+        return this.smoothPath(this.reconstruct(cur));
       }
-      
-      closedSet.add(currentKey);
-      
-      const neighbors = this.getNeighbors(current.x, current.y);
-      for (const neighbor of neighbors) {
-        const neighborKey = `${neighbor.x},${neighbor.y}`;
-        
-        if (closedSet.has(neighborKey)) continue;
-        
-        const tentativeG = current.g + this.gridSize;
-        const existing = openSet.find(n => n.x === neighbor.x && n.y === neighbor.y);
-        
-        if (!existing) {
-          openSet.push({
-            x: neighbor.x,
-            y: neighbor.y,
-            g: tentativeG,
-            h: this.heuristic(neighbor, endNode),
-            parent: current,
-          });
-        } else if (tentativeG < existing.g) {
-          existing.g = tentativeG;
-          existing.parent = current;
+
+      for (const [dc, dr, cost] of DIRS) {
+        const nc = cur.x + dc;
+        const nr = cur.y + dr;
+
+        if (!this.walkableAt(nc, nr)) continue;
+
+        // Diagonal corner-cutting: both adjacent cardinal cells must be walkable
+        if (dc !== 0 && dr !== 0) {
+          if (!this.walkableAt(cur.x + dc, cur.y) ||
+              !this.walkableAt(cur.x, cur.y + dr)) continue;
+        }
+
+        const nkey = nr * this.COLS + nc;
+        if (closedSet.has(nkey)) continue;
+
+        const ng = cur.g + cost;
+        if ((bestG.get(nkey) ?? Infinity) <= ng) continue;
+
+        bestG.set(nkey, ng);
+        const nh = this.heuristic(nc, nr, tc, tr);
+        openSet.push({ x: nc, y: nr, g: ng, h: nh, f: ng + nh, parent: cur });
+      }
+    }
+
+    return []; // no path
+  }
+
+  private reconstruct(node: HeapNode): Array<{ c: number; r: number }> {
+    const path: Array<{ c: number; r: number }> = [];
+    let cur: HeapNode | null = node;
+    while (cur) {
+      path.unshift({ c: cur.x, r: cur.y });
+      cur = cur.parent;
+    }
+    return path;
+  }
+
+  /**
+   * String-pulling (line-of-sight) path smoothing.
+   * Removes intermediate waypoints that can be replaced by a direct sight line.
+   */
+  private smoothPath(
+    path: Array<{ c: number; r: number }>
+  ): Array<{ x: number; y: number }> {
+    if (path.length <= 2) {
+      return path.map((p) => ({ x: this.toWorld(p.c), y: this.toWorld(p.r) }));
+    }
+
+    const smooth: Array<{ c: number; r: number }> = [path[0]];
+    let anchor = 0;
+
+    for (let i = 2; i < path.length; i++) {
+      if (!this.hasLOS(path[anchor], path[i])) {
+        smooth.push(path[i - 1]);
+        anchor = i - 1;
+      }
+    }
+    smooth.push(path[path.length - 1]);
+
+    return smooth.map((p) => ({ x: this.toWorld(p.c), y: this.toWorld(p.r) }));
+  }
+
+  /** Bresenham line-of-sight check on the walkability grid. */
+  private hasLOS(a: { c: number; r: number }, b: { c: number; r: number }): boolean {
+    let x0 = a.c, y0 = a.r;
+    const x1 = b.c, y1 = b.r;
+    const dx = Math.abs(x1 - x0);
+    const dy = Math.abs(y1 - y0);
+    const sx = x0 < x1 ? 1 : -1;
+    const sy = y0 < y1 ? 1 : -1;
+    let err = dx - dy;
+
+    while (true) {
+      if (!this.walkableAt(x0, y0)) return false;
+      if (x0 === x1 && y0 === y1) break;
+      const e2 = 2 * err;
+      if (e2 > -dy) { err -= dy; x0 += sx; }
+      if (e2 < dx)  { err += dx; y0 += sy; }
+    }
+    return true;
+  }
+
+  /** BFS outward from (ec, er) to find the nearest walkable cell. */
+  private nearestWalkable(
+    ec: number, er: number
+  ): { c: number; r: number } | null {
+    const visited = new Set<number>();
+    const queue: Array<{ c: number; r: number }> = [{ c: ec, r: er }];
+    visited.add(er * this.COLS + ec);
+
+    for (let i = 0; i < queue.length && i < 500; i++) {
+      const { c, r } = queue[i];
+      if (this.walkableAt(c, r)) return { c, r };
+      for (const [dc, dr] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+        const nc = c + dc, nr = r + dr;
+        const nk = nr * this.COLS + nc;
+        if (!visited.has(nk)) {
+          visited.add(nk);
+          queue.push({ c: nc, r: nr });
         }
       }
     }
-    
-    return [];
-  }
-
-  private getGridCoord(x: number, y: number): { x: number; y: number } {
-    return {
-      x: Math.floor(x / this.gridSize) * this.gridSize,
-      y: Math.floor(y / this.gridSize) * this.gridSize,
-    };
-  }
-
-  private heuristic(a: { x: number; y: number }, b: { x: number; y: number }): number {
-    return Math.abs(a.x - b.x) + Math.abs(a.y - b.y);
-  }
-
-  private getNeighbors(x: number, y: number): Array<{ x: number; y: number }> {
-    const neighbors: Array<{ x: number; y: number }> = [];
-    const directions = [
-      { dx: this.gridSize, dy: 0 },
-      { dx: -this.gridSize, dy: 0 },
-      { dx: 0, dy: this.gridSize },
-      { dx: 0, dy: -this.gridSize },
-    ];
-    
-    for (const dir of directions) {
-      const nx = x + dir.dx;
-      const ny = y + dir.dy;
-      if (this.gridNavData.has(`${nx},${ny}`)) {
-        neighbors.push({ x: nx, y: ny });
-      }
-    }
-    
-    return neighbors;
-  }
-
-  private reconstructPath(
-    endNode: { x: number; y: number; parent?: { x: number; y: number } }
-  ): Array<{ x: number; y: number }> {
-    const path: Array<{ x: number; y: number }> = [];
-    let current: typeof endNode | undefined = endNode;
-    
-    while (current) {
-      path.unshift({ x: current.x, y: current.y });
-      current = current.parent as typeof endNode | undefined;
-    }
-    
-    return path;
+    return null;
   }
 }

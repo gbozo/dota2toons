@@ -1,0 +1,22 @@
+{
+  "name": "dota2toons",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Dota 2 Toons — web-based MOBA",
+  "scripts": {
+    "dev": "concurrently --names \"BE,FE\" --prefix-colors \"cyan,magenta\" \"npm run dev:be\" \"npm run dev:fe\"",
+    "dev:fe": "npm run dev --prefix frontend",
+    "dev:be": "go run ./cmd/server",
+    "build": "npm run build:be && npm run build:fe",
+    "build:fe": "npm run build --prefix frontend",
+    "build:be": "go build -o dist/server ./cmd/server",
+    "type-check": "npm run build --prefix frontend -- --emptyOutDir=false 2>&1 | head -20 || npx --prefix frontend tsc --noEmit",
+    "test": "npm run test:be",
+    "test:be": "go test ./internal/...",
+    "lint:be": "go vet ./...",
+    "install:fe": "npm install --prefix frontend"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}

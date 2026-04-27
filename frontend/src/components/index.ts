@@ -1,6 +1,5 @@
-export interface Component {
-  readonly componentId: string;
-}
+import type { Component } from '../ecs/world';
+export type { Component };
 
 export const PositionComponentId = 'position';
 

@@ -45,6 +45,7 @@ import {
   type AbilityComponent,
 } from './components/index';
 import { HERO_ABILITIES, ABILITY_BY_ID } from './data/heroAbilities';
+import { ITEMS, ITEM_BY_ID, ITEM_CATEGORIES } from './data/items';
 import type { MapData, Team } from './types/game';
 
 // ---------------------------------------------------------------------------
@@ -61,10 +62,10 @@ interface UIState {
   status: string;
   mouseCoord: string;
   // Top bar
-  gameClock: number;   // seconds
+  gameClock: number;
   killsRadiant: number;
   killsDire: number;
-  // Bottom bar — local hero
+  // Bottom bar
   selectedHero: string | null;
   heroHp: number;
   heroMaxHp: number;
@@ -78,14 +79,20 @@ interface UIState {
   abilities: Array<{
     name: string;
     key: string;
-    cooldownPct: number;  // 0 = ready, 1 = full cooldown
+    cooldownPct: number;
     manaCost: number;
     level: number;
   }>;
-  // Kill feed events
+  // Inventory
+  items: Array<string | null>;
+  // Overlays
+  shopOpen: boolean;
+  scoreboardOpen: boolean;
+  // Kill feed
   killFeed: Array<{ id: number; text: string; color: string }>;
+  // Damage numbers (consumed by canvas draw)
+  damageNumbers: Array<{ id: number; text: string; x: number; y: number; color: string; born: number }>;
 }
-
 // ── Colour palette ──────────────────────────────────────────────────────────
 const C = {
   radiant: '#4a9eff',
@@ -211,6 +218,8 @@ function BottomBar({ ui }: { ui: UIState }) {
           })}
         </div>
       )}
+
+      <InventoryBar items={ui.items} gold={ui.gold} />
     </div>
   );
 }
@@ -237,9 +246,143 @@ function KillFeed({ events }: { events: UIState['killFeed'] }) {
   );
 }
 
+// ── Inventory bar ────────────────────────────────────────────────────────────
+function InventoryBar({ items, gold, onBuy }: {
+  items: Array<string | null>;
+  gold: number;
+  onBuy?: (itemId: string) => void;
+}) {
+  void onBuy;
+  return (
+    <div style={{ display: 'flex', gap: 4, alignItems: 'center', marginLeft: 8 }}>
+      {items.map((itemId, i) => {
+        const item = itemId ? ITEM_BY_ID.get(itemId) : null;
+        return (
+          <div key={i} title={item ? `${item.name}\n${item.description}` : 'Empty'} style={{
+            width: 36, height: 36,
+            background: item ? C.bgLight : 'rgba(0,0,0,0.3)',
+            border: `1px solid ${item ? C.border : 'rgba(60,70,90,0.4)'}`,
+            borderRadius: 4,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            fontSize: 9, color: item ? '#ccc' : '#444',
+            textAlign: 'center', cursor: 'default',
+          }}>
+            {item ? item.name.split(' ').map(w => w[0]).join('') : ''}
+          </div>
+        );
+      })}
+      <div style={{ color: C.gold, fontSize: 11, marginLeft: 4 }}>⬡{Math.floor(gold)}</div>
+    </div>
+  );
+}
+
+// ── Shop ─────────────────────────────────────────────────────────────────────
+function Shop({ gold, items, onBuy, onClose }: {
+  gold: number;
+  items: Array<string | null>;
+  onBuy: (itemId: string) => void;
+  onClose: () => void;
+}) {
+  const [selectedCat, setSelectedCat] = React.useState<string>('basic');
+  const filtered = ITEMS.filter(i => i.category === selectedCat);
+  const slotsUsed = items.filter(Boolean).length;
+
+  return (
+    <div style={{
+      position: 'absolute', top: '50%', left: '50%',
+      transform: 'translate(-50%,-50%)',
+      background: C.bg, border: `1px solid ${C.border}`,
+      borderRadius: 8, padding: 16, minWidth: 360,
+      fontFamily: 'monospace', zIndex: 100,
+      pointerEvents: 'all',
+    }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 12, alignItems: 'center' }}>
+        <span style={{ color: '#ccc', fontSize: 14 }}>Shop</span>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <span style={{ color: C.gold, fontSize: 13 }}>⬡ {Math.floor(gold)}</span>
+          <button onClick={onClose} style={{
+            background: 'none', border: `1px solid ${C.border}`, color: '#888',
+            borderRadius: 4, padding: '2px 8px', cursor: 'pointer', fontFamily: 'monospace',
+          }}>✕</button>
+        </div>
+      </div>
+
+      {/* Category tabs */}
+      <div style={{ display: 'flex', gap: 6, marginBottom: 12 }}>
+        {ITEM_CATEGORIES.map(cat => (
+          <button key={cat} onClick={() => setSelectedCat(cat)} style={{
+            background: selectedCat === cat ? C.bgLight : 'transparent',
+            border: `1px solid ${selectedCat === cat ? C.border : 'rgba(60,70,90,0.3)'}`,
+            color: selectedCat === cat ? '#ccc' : '#666',
+            borderRadius: 4, padding: '2px 8px', cursor: 'pointer',
+            fontFamily: 'monospace', fontSize: 11, textTransform: 'capitalize',
+          }}>{cat}</button>
+        ))}
+      </div>
+
+      {/* Items */}
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+        {filtered.map(item => {
+          const canAfford = gold >= item.cost;
+          const canBuy    = canAfford && slotsUsed < 6;
+          return (
+            <div key={item.id} title={item.description} onClick={() => canBuy && onBuy(item.id)}
+              style={{
+                width: 120, background: C.bgLight,
+                border: `1px solid ${canBuy ? C.border : 'rgba(60,70,90,0.3)'}`,
+                borderRadius: 6, padding: '6px 8px', cursor: canBuy ? 'pointer' : 'default',
+                opacity: canBuy ? 1 : 0.5,
+              }}>
+              <div style={{ color: '#ddd', fontSize: 11, marginBottom: 2 }}>{item.name}</div>
+              <div style={{ color: C.gold, fontSize: 12 }}>⬡ {item.cost}</div>
+              <div style={{ color: '#777', fontSize: 9, marginTop: 2 }}>{item.description}</div>
+            </div>
+          );
+        })}
+      </div>
+
+      <div style={{ color: '#555', fontSize: 10, marginTop: 10 }}>
+        {slotsUsed}/6 slots used &nbsp;·&nbsp; Press B to close
+      </div>
+    </div>
+  );
+}
+
+// ── Scoreboard ───────────────────────────────────────────────────────────────
+function Scoreboard({ ui }: { ui: UIState }) {
+  return (
+    <div style={{
+      position: 'absolute', top: '50%', left: '50%',
+      transform: 'translate(-50%,-50%)',
+      background: C.bg, border: `1px solid ${C.border}`,
+      borderRadius: 8, padding: 16, minWidth: 480,
+      fontFamily: 'monospace', zIndex: 100, pointerEvents: 'none',
+    }}>
+      <div style={{ color: '#ccc', fontSize: 14, marginBottom: 12, textAlign: 'center' }}>
+        Scoreboard &nbsp;
+        <span style={{ color: C.radiant }}>{ui.killsRadiant}</span>
+        <span style={{ color: '#555' }}> – </span>
+        <span style={{ color: C.dire }}>{ui.killsDire}</span>
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+        <div>
+          <div style={{ color: C.radiant, marginBottom: 6, fontSize: 11 }}>RADIANT</div>
+          <div style={{ color: '#888', fontSize: 10 }}>Hero info available in Phase 7 (multiplayer)</div>
+        </div>
+        <div>
+          <div style={{ color: C.dire, marginBottom: 6, fontSize: 11 }}>DIRE</div>
+          <div style={{ color: '#888', fontSize: 10 }}>Hero info available in Phase 7 (multiplayer)</div>
+        </div>
+      </div>
+      <div style={{ color: '#444', fontSize: 10, marginTop: 10, textAlign: 'center' }}>
+        Hold Tab to view
+      </div>
+    </div>
+  );
+}
+
 // ── HUD root ────────────────────────────────────────────────────────────────
 function HUD({ ui, onSetUI }: { ui: UIState; onSetUI: (s: Partial<UIState>) => void }) {
-  void onSetUI;
   return (
     <>
       {/* Status message */}
@@ -275,6 +418,19 @@ function HUD({ ui, onSetUI }: { ui: UIState; onSetUI: (s: Partial<UIState>) => v
       <BottomBar ui={ui} />
       <KillFeed events={ui.killFeed} />
 
+      {/* Shop overlay */}
+      {ui.shopOpen && (
+        <Shop
+          gold={ui.gold}
+          items={ui.items}
+          onBuy={(itemId) => onSetUI({ shopOpen: false, _buyItem: itemId } as any)}
+          onClose={() => onSetUI({ shopOpen: false })}
+        />
+      )}
+
+      {/* Scoreboard overlay */}
+      {ui.scoreboardOpen && <Scoreboard ui={ui} />}
+
       {/* Controls hint */}
       <div style={{
         position: 'absolute', top: 8, right: 8,
@@ -282,7 +438,8 @@ function HUD({ ui, onSetUI }: { ui: UIState; onSetUI: (s: Partial<UIState>) => v
         pointerEvents: 'none', lineHeight: 1.7, textAlign: 'right',
       }}>
         RMB: move/attack&nbsp;&nbsp;LMB: select<br />
-        WASD: camera&nbsp;&nbsp;Scroll: zoom&nbsp;&nbsp;Space: follow
+        WASD: camera&nbsp;&nbsp;Scroll: zoom&nbsp;&nbsp;Space: follow<br />
+        B: shop&nbsp;&nbsp;Tab: scoreboard
       </div>
     </>
   );
@@ -482,6 +639,8 @@ class Game {
       this.hudCanvas = hc;
       this.hudCtx    = hc.getContext('2d');
     }
+    // Minimap click-to-pan — listen on window, check minimap region
+    window.addEventListener('mousedown', (e) => this.handleHudCanvasClick(e));
 
     // Mouse coord tracker — now that scene objects exist
     coordEl = document.getElementById('mouse-coord');
@@ -790,6 +949,7 @@ class Game {
       this.inputMgr?.update(frame);
 
       this.processDeathsForUI();
+      this.processHitsForUI();
       this.syncMeshes(dtSec, alpha);
       this.syncCreeps(alpha);
       this.syncHudStats(frame);
@@ -969,6 +1129,23 @@ class Game {
     }
 
     this.drawMinimap(ctx, W, H);
+    this.drawDamageNumbers(ctx);
+  }
+
+  private drawDamageNumbers(ctx: CanvasRenderingContext2D): void {
+    const now  = performance.now();
+    const LIFE = 1200; // ms
+    ctx.font   = 'bold 13px monospace';
+
+    this._dmgNums = this._dmgNums.filter(n => now - n.born < LIFE);
+
+    for (const n of this._dmgNums) {
+      const progress = (now - n.born) / LIFE;
+      ctx.globalAlpha = 1 - progress;
+      ctx.fillStyle   = n.color;
+      ctx.fillText(n.text, n.x + (Math.random() * 2 - 1), n.y - 40 * progress);
+    }
+    ctx.globalAlpha = 1;
   }
 
   private gameClockMs  = 0;
@@ -977,6 +1154,24 @@ class Game {
   private killsDire    = 0;
 
   /** Called each tick to process death events for kill feed + scoreboard. */
+  private dmgNumSeq = 0;
+  _dmgNums: UIState['damageNumbers'] = [];
+
+  private processHitsForUI(): void {
+    for (const evt of this.combatSystem.hitEvents) {
+      const pos = this.world.getComponent<PositionComponent>(evt.targetId, PositionComponentId);
+      if (!pos || !this.camera || !this.hudCanvas) continue;
+      this._screenPos.set(pos.x, pos.z * ELEVATION_SCALE + 80, -pos.y);
+      this._screenPos.project(this.camera);
+      if (this._screenPos.z > 1) continue;
+      const sx = ( this._screenPos.x + 1) / 2 * this.hudCanvas.width;
+      const sy = (-this._screenPos.y + 1) / 2 * this.hudCanvas.height;
+      const color = evt.damageType === 'magical' ? '#88aaff' : '#ffffff';
+      this._dmgNums.push({ id: ++this.dmgNumSeq, text: String(evt.damage), x: sx, y: sy, color, born: performance.now() });
+      if (this._dmgNums.length > 30) this._dmgNums.shift();
+    }
+  }
+
   private processDeathsForUI(): void {
     for (const evt of this.combatSystem.deathEvents) {
       const ut   = this.world.getComponent<any>(evt.entityId, 'unitType');
@@ -1058,6 +1253,7 @@ class Game {
       heroMana:     hp?.mana  ?? s.heroMana,
       heroMaxMana:  hp?.maxMana ?? s.heroMaxMana,
       abilities,
+      items: inv?.items ?? s.items,
     }));
   }
 
@@ -1068,12 +1264,61 @@ class Game {
     if (pos) this.cameraCtrl?.centerOn(pos.x, pos.y);
   }
 
+  buyItem(itemId: string): void {
+    if (!this.localHeroId) return;
+    const inv = this.world.getComponent<any>(this.localHeroId, InventoryComponentId);
+    if (!inv) return;
+    const def = ITEM_BY_ID.get(itemId);
+    if (!def) return;
+    if (inv.gold < def.cost) return;
+    const slot = inv.items.findIndex((s: string | null) => s === null);
+    if (slot === -1) return; // no free slots
+
+    inv.gold -= def.cost;
+    inv.items[slot] = itemId;
+
+    // Apply stat bonuses
+    const hp = this.world.getComponent<any>(this.localHeroId, 'health');
+    const combat = this.world.getComponent<any>(this.localHeroId, 'combat');
+    if (hp) {
+      if (def.bonuses.hp)   { hp.maxHp   += def.bonuses.hp;   hp.hp   = Math.min(hp.hp + def.bonuses.hp, hp.maxHp); }
+      if (def.bonuses.mana) { hp.maxMana += def.bonuses.mana; hp.mana = Math.min(hp.mana + def.bonuses.mana, hp.maxMana); }
+    }
+    if (combat) {
+      if (def.bonuses.damageMin) { combat.damageMin += def.bonuses.damageMin; combat.damageMax += def.bonuses.damageMax ?? 0; }
+      if (def.bonuses.armor)     combat.armor += def.bonuses.armor;
+    }
+  }
+
   dispose(): void {
     cancelAnimationFrame(this.rafId);
     this.cameraCtrl?.dispose();
     this.inputMgr?.dispose();
     this.mouseTracker?.dispose();
     this.renderer?.dispose();
+  }
+
+  private handleHudCanvasClick(e: MouseEvent): void {
+    if (!this.hudCanvas || !this.cameraCtrl) return;
+    const W    = this.hudCanvas.width;
+    const H    = this.hudCanvas.height;
+    const SIZE = Math.min(W, H) * 0.18;
+    const PAD  = 10;
+    const mx   = PAD;
+    const my   = H - SIZE - PAD;
+    const cx   = e.clientX * (W / this.hudCanvas.clientWidth);
+    const cy   = e.clientY * (H / this.hudCanvas.clientHeight);
+
+    // Only handle clicks inside the minimap rect
+    if (cx < mx || cx > mx + SIZE || cy < my || cy > my + SIZE) return;
+
+    e.stopPropagation();
+    const MAP = 20928;
+    const nx  = (cx - mx) / SIZE;             // 0→1 left→right
+    const ny  = (cy - my) / SIZE;             // 0→1 top→bottom
+    const gameX = nx * MAP - MAP / 2;
+    const gameY = -(ny * MAP - MAP / 2);      // flip Y (top=Dire=+Y)
+    this.cameraCtrl.centerOn(gameX, gameY);
   }
 
   private drawMinimap(ctx: CanvasRenderingContext2D, W: number, H: number): void {
@@ -1179,14 +1424,18 @@ function Root() {
     gameClock: 0, killsRadiant: 0, killsDire: 0,
     selectedHero: null, heroHp: 600, heroMaxHp: 600, heroMana: 200, heroMaxMana: 200,
     gold: 600, level: 1, xp: 0, xpToNext: 230,
-    abilities: [],
-    killFeed: [],
+    abilities: [], items: [null,null,null,null,null,null],
+    shopOpen: false, scoreboardOpen: false,
+    killFeed: [], damageNumbers: [],
   });
   React.useEffect(() => {
     updateUI = setUI;
     return () => { updateUI = null; };
   }, []);
-  return <HUD ui={ui} onSetUI={p => setUI(s => ({ ...s, ...p }))} />;
+  return <HUD ui={ui} onSetUI={(p: Partial<UIState> & { _buyItem?: string }) => {
+    if (p._buyItem) { gameRef?.buyItem(p._buyItem); return; }
+    setUI(s => ({ ...s, ...p }));
+  }} />;
 }
 
 createRoot(uiRoot).render(<Root />);
@@ -1209,6 +1458,11 @@ window.addEventListener('resize', () => {
 
 window.addEventListener('keydown', e => {
   if (e.code === 'Space') { e.preventDefault(); gameRef?.centerOnHero(); }
+  if (e.code === 'KeyB')  { e.preventDefault(); updateUI?.(s => ({ ...s, shopOpen: !s.shopOpen })); }
+  if (e.code === 'Tab')   { e.preventDefault(); updateUI?.(s => ({ ...s, scoreboardOpen: true })); }
+});
+window.addEventListener('keyup', e => {
+  if (e.code === 'Tab') { updateUI?.(s => ({ ...s, scoreboardOpen: false })); }
 });
 
 let gameRef: Game | null = null;

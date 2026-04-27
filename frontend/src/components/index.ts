@@ -272,8 +272,9 @@ export interface InventoryComponent extends Component {
   gold: number;
   xp: number;
   level: number;
-  /** XP accumulated toward next level */
   xpToNextLevel: number;
+  /** Item slot IDs — null means empty, max 6 slots */
+  items: Array<string | null>;
 }
 
 // XP required to reach each level (SPEC table)
@@ -286,6 +287,7 @@ export function createInventoryComponent(startingGold = 600): InventoryComponent
     xp: 0,
     level: 1,
     xpToNextLevel: XP_PER_LEVEL[1],
+    items: [null, null, null, null, null, null],
   };
 }
 

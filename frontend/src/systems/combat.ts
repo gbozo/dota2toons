@@ -35,18 +35,24 @@ export interface DeathEvent {
   team: string;
 }
 
+export interface HitEvent {
+  targetId: string;
+  damage: number;
+  damageType: string;
+}
+
 export class CombatSystem implements System {
   readonly name = 'combat';
 
-  /** Accumulated game time in ms */
   private gameTime = 0;
 
-  /** Death events generated this tick — consumed by EconomySystem */
   deathEvents: DeathEvent[] = [];
+  hitEvents: HitEvent[] = [];
 
   update(dt: number, world: World): void {
     this.gameTime += dt;
     this.deathEvents = [];
+    this.hitEvents   = [];
 
     for (const entity of world.entities.values()) {
       if (!entity.active) continue;
@@ -89,6 +95,7 @@ export class CombatSystem implements System {
 
       targetHP.hp = Math.max(0, targetHP.hp - finalDamage);
       combat.lastAttackTime = this.gameTime;
+      this.hitEvents.push({ targetId: combat.targetId!, damage: finalDamage, damageType: 'physical' });
 
       // Handle death
       if (targetHP.hp <= 0) {

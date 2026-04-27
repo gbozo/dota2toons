@@ -222,12 +222,38 @@ export class HeroModelLoader {
     // that rotation. We wrap it in a root group that syncMeshes drives.
     // Scale 0.5 → ~80 world units tall (close to one 64-unit grid cell).
     const info = HERO_DATA[heroKey];
-    const s = (info?.scale ?? 1.0) * 0.5;
+    const s = (info?.scale ?? 1.0) * 2.0;
 
     const root = new THREE.Group();
     root.name = heroKey;
-    root.scale.setScalar(s);  // scale on root, not on scene child
+    root.scale.setScalar(s);
+
+    // The GLTF baked matrix leaves the model facing +X in Three.js space.
+    // Wrap scene in a pivot so we can fix the base orientation without
+    // interfering with syncMeshes driving root.rotation.y for facing direction.
+    // Rotate -90° around X to lay the model flat (top-down view),
+    // then 0° around Y initially — syncMeshes drives that.
+    scene.rotation.x = -Math.PI / 2;
+    scene.rotation.y = Math.PI; // face north (toward Dire) by default
+    scene.position.y = 0;
     root.add(scene);
+
+    // These meshes are SkinnedMesh nodes. In Three.js, SkinnedMesh uses an
+    // 'attached' bind mode by default: bone matrices are computed in world space
+    // and the mesh ignores its own parent transform — so the geometry stays
+    // pinned at world origin no matter where root is moved.
+    //
+    // Fix: switch every SkinnedMesh to DetachedBindMode so it respects the
+    // parent chain like a normal mesh, then reset the bind matrix to identity.
+    root.traverse((obj) => {
+      obj.matrixAutoUpdate = true;
+      if ((obj as THREE.SkinnedMesh).isSkinnedMesh) {
+        const sm = obj as THREE.SkinnedMesh;
+        sm.bindMode = THREE.DetachedBindMode;
+        sm.bindMatrix.identity();
+        sm.bindMatrixInverse.identity();
+      }
+    });
 
     // AnimationMixer
     let mixer: THREE.AnimationMixer | null = null;

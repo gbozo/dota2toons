@@ -64,14 +64,14 @@ function HUD({ ui, onSetUI }: { ui: UIState; onSetUI: (s: Partial<UIState>) => v
         </div>
       )}
 
-      {/* Debug: mouse coord */}
+      {/* Debug: mouse coord + grid + elevation */}
       <div id="mouse-coord" style={{
         position: 'absolute', top: 8, left: '50%', transform: 'translateX(-50%)',
-        color: '#ffd700', fontFamily: 'monospace', fontSize: '13px',
-        background: 'rgba(0,0,0,0.6)', padding: '4px 12px', borderRadius: 4,
-        pointerEvents: 'none', minWidth: 180, textAlign: 'center',
+        fontFamily: 'monospace', fontSize: '12px',
+        background: 'rgba(0,0,0,0.7)', padding: '4px 14px', borderRadius: 4,
+        pointerEvents: 'none', whiteSpace: 'nowrap', textAlign: 'center',
       }}>
-        {ui.mouseCoord || 'map: —'}
+        map: —
       </div>
 
       {ui.selectedHero && (
@@ -200,11 +200,9 @@ class Game {
     // Camera controller — start centered on map
     this.cameraCtrl = new CameraController(this.camera, this.renderer, 0, 0, 26000);
 
-    // Mouse coord tracker — writes into the React state
-    const coordEl = document.getElementById('mouse-coord');
-    if (coordEl) {
-      this.mouseTracker = new MouseCoordTracker(this.camera, canvas, coordEl);
-    }
+    // Mouse coord tracker — created after scene objects are added so it can pick them.
+    // Defer init to after map geometry is placed (see below).
+    let coordEl: HTMLElement | null = null;
 
     // Map geometry
     this.status('Building terrain...');
@@ -227,6 +225,32 @@ class Game {
     this.heroGroup.name = 'heroes';
     this.scene.add(this.heroGroup);
 
+    // Mouse coord tracker — now that scene objects exist
+    coordEl = document.getElementById('mouse-coord');
+    if (coordEl) {
+      this.mouseTracker = new MouseCoordTracker(
+        this.camera, canvas, coordEl,
+        this.mapData!.elevation,
+        this.scene,
+        // Resolve a hovered mesh to a display label
+        (obj) => {
+          // Hero entity?
+          const entityId = this.entityMeshMap.get(obj.uuid);
+          if (entityId) {
+            const rec = this.entities.get(entityId);
+            if (rec) return `${rec.heroKey} (${rec.team})`;
+          }
+          // Building / named scene object?
+          if (obj.name && obj.name !== '' &&
+              obj.name !== 'terrain' && obj.name !== 'trees' &&
+              obj.name !== 'heroes' && !obj.name.startsWith('entity_')) {
+            return obj.name;
+          }
+          return null;
+        }
+      );
+    }
+
     // Input
     this.inputMgr = new InputManager({
       canvas,
@@ -246,7 +270,7 @@ class Game {
     this.status('Spawning heroes...');
     await Promise.all([
       // Radiant fountain: (-7456, -6938) in game coords = Three.js (-7456, z, -6938)
-      this.spawnHero('axe',   'radiant', -7456, -6938, true),
+      this.spawnHero('axe',   'radiant', -7456 + 640, -6938, true),
       // Dire fountain: (7408, 6848)
       this.spawnHero('pudge', 'dire',     7408,  6848, false),
     ]);
@@ -278,7 +302,13 @@ class Game {
     const entity = this.world.createEntity();
     const elev   = this.movementSystem!.getElevation(gameX, gameY);
 
-    this.world.addComponent(entity.id, createPositionComponent(gameX, gameY, elev));
+    // Initial facing: Radiant heroes face toward Dire base, Dire heroes face toward Radiant
+    const RADIANT_BASE = { x: -7456, y: -6938 };
+    const DIRE_BASE    = { x:  7408, y:  6848 };
+    const target = team === 'radiant' ? DIRE_BASE : RADIANT_BASE;
+    const initialRotation = Math.atan2(target.y - gameY, target.x - gameX);
+
+    this.world.addComponent(entity.id, createPositionComponent(gameX, gameY, elev, initialRotation));
     this.world.addComponent(entity.id, createVelocityComponent());
     this.world.addComponent(entity.id, createTeamComponent(team));
     this.world.addComponent(entity.id, createUnitTypeComponent('hero', heroKey));
@@ -311,7 +341,7 @@ class Game {
 
     // Swap to real GLTF when loaded
     instancePromise.then(real => {
-      real.root.position.set(gameX, worldY, -gameY);  // game Y → Three -Z
+      real.root.position.set(gameX, worldY, -gameY);
       fallback.root.remove(selRing);
       real.root.add(selRing);
 
@@ -405,14 +435,29 @@ class Game {
     this.rafId = requestAnimationFrame(loop);
   }
 
+  private syncFrame = 0;
   private syncMeshes(): void {
+    this.syncFrame++;
     for (const [id, rec] of this.entities) {
       const pos = this.world.getComponent<PositionComponent>(id, PositionComponentId);
       if (!pos) continue;
       const worldY = pos.z * ELEVATION_SCALE;
       rec.instance.root.position.set(pos.x, worldY, -pos.y);
       rec.instance.root.rotation.y = -pos.rotation;
-      rec.label.position.set(pos.x, worldY + 100, -pos.y);
+      rec.label.position.set(pos.x, worldY + 350, -pos.y);
+
+      // Debug: log once per second for axe
+      if (rec.heroKey === 'axe' && this.syncFrame % 60 === 0) {
+        const wp = rec.instance.root.position;
+        const wmat = new THREE.Vector3();
+        rec.instance.root.getWorldPosition(wmat);
+        console.log(
+          `[sync] axe ECS=(${pos.x.toFixed(0)},${pos.y.toFixed(0)},${pos.z})` +
+          ` root.pos=(${wp.x.toFixed(0)},${wp.y.toFixed(0)},${wp.z.toFixed(0)})` +
+          ` world=(${wmat.x.toFixed(0)},${wmat.y.toFixed(0)},${wmat.z.toFixed(0)})` +
+          ` instance=${rec.instance === rec.instance ? rec.heroKey : '?'} isFallback=${!rec.instance.mixer}`
+        );
+      }
     }
   }
 

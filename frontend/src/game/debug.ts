@@ -32,7 +32,7 @@ function makeTextSprite(text: string, color = '#ffffff', size = 28): THREE.Sprit
   const tex  = new THREE.CanvasTexture(canvas);
   const mat  = new THREE.SpriteMaterial({ map: tex, depthWrite: false, transparent: true });
   const sprite = new THREE.Sprite(mat);
-  sprite.scale.set(600, 150, 1);
+  sprite.scale.set(120, 30, 1);
   return sprite;
 }
 
@@ -138,6 +138,11 @@ export function addLabel(
 
 // ── Mouse-world raycaster ──────────────────────────────────────────────────
 
+const GRID_SIZE   = 64;
+const GRID_OFFSET = -10464;
+const GRID_COLS   = 327;
+const GRID_ROWS   = 327;
+
 export class MouseCoordTracker {
   private raycaster  = new THREE.Raycaster();
   private ndc        = new THREE.Vector2();
@@ -146,12 +151,25 @@ export class MouseCoordTracker {
   private camera:    THREE.Camera;
   private canvas:    HTMLCanvasElement;
   private displayEl: HTMLElement;
+  private elevation: number[][];
+  private scene:     THREE.Scene | null = null;
+  private getLabel:  ((obj: THREE.Object3D) => string | null) | null = null;
   private cleanup:   Array<() => void> = [];
 
-  constructor(camera: THREE.Camera, canvas: HTMLCanvasElement, displayEl: HTMLElement) {
+  constructor(
+    camera: THREE.Camera,
+    canvas: HTMLCanvasElement,
+    displayEl: HTMLElement,
+    elevation: number[][],
+    scene?: THREE.Scene,
+    getLabel?: (obj: THREE.Object3D) => string | null
+  ) {
     this.camera    = camera;
     this.canvas    = canvas;
     this.displayEl = displayEl;
+    this.elevation = elevation;
+    this.scene     = scene ?? null;
+    this.getLabel  = getLabel ?? null;
 
     const mm = (e: MouseEvent) => this.onMove(e);
     window.addEventListener('mousemove', mm);
@@ -164,13 +182,70 @@ export class MouseCoordTracker {
     this.ndc.y = -((e.clientY - rect.top)  / rect.height) * 2 + 1;
 
     this.raycaster.setFromCamera(this.ndc, this.camera);
-    if (this.raycaster.ray.intersectPlane(this.plane, this.target)) {
-      // Three X = game X, Three Z = -game Y
-      const gameX = this.target.x;
-      const gameY = -this.target.z;
-      this.displayEl.textContent =
-        `map: (${gameX.toFixed(0)}, ${gameY.toFixed(0)})`;
+
+    // ── ground plane hit ────────────────────────────────────────────────────
+    if (!this.raycaster.ray.intersectPlane(this.plane, this.target)) return;
+
+    const gameX = this.target.x;
+    const gameY = -this.target.z;
+
+    const col = Math.floor((gameX - GRID_OFFSET) / GRID_SIZE);
+    const row = Math.floor((gameY - GRID_OFFSET) / GRID_SIZE);
+
+    let elevStr = '—';
+    if (col >= 0 && col < GRID_COLS && row >= 0 && row < GRID_ROWS &&
+        this.elevation[row]?.[col] !== undefined) {
+      const raw = this.elevation[row][col];
+      elevStr = raw < 0 ? 'outside' : String(raw);
     }
+
+    // ── object hover ─────────────────────────────────────────────────────────
+    let hoverStr = '';
+    if (this.scene) {
+      // Raycast against the full scene recursively, then filter results
+      const hits = this.raycaster.intersectObjects(this.scene.children, true);
+
+      // Skip terrain, grid lines, sprites, rings
+      const SKIP_NAMES = new Set([
+        'terrain', 'cursor_ring', 'selection_ring', 'debug_grid', 'trees',
+      ]);
+      const real = hits.find(h => {
+        if (h.object.type === 'Sprite' || h.object.type === 'Line') return false;
+        // Walk up to check no ancestor is debug_grid
+        let o: THREE.Object3D | null = h.object;
+        while (o) {
+          if (SKIP_NAMES.has(o.name)) return false;
+          o = o.parent;
+        }
+        return true;
+      });
+
+      if (real) {
+        let label: string | null = null;
+        let o: THREE.Object3D | null = real.object;
+        while (o) {
+          if (this.getLabel) {
+            label = this.getLabel(o);
+            if (label) break;
+          }
+          if (o.name && o.name !== '' &&
+              o.name !== 'buildings' && o.name !== 'heroes') {
+            label = o.name;
+            break;
+          }
+          o = o.parent;
+        }
+        if (label) {
+          hoverStr = `&nbsp;&nbsp;<span style="color:#ffaa44">▶ ${label}</span>`;
+        }
+      }
+    }
+
+    this.displayEl.innerHTML =
+      `<span style="color:#ffd700">map (${gameX.toFixed(0)}, ${gameY.toFixed(0)})</span>` +
+      `&nbsp;&nbsp;<span style="color:#88ccff">col ${col} row ${row}</span>` +
+      `&nbsp;&nbsp;<span style="color:#88ff88">elev ${elevStr}</span>` +
+      hoverStr;
   }
 
   dispose(): void {

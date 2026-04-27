@@ -4,184 +4,269 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/vmihailenco/msgpack/v5"
 
+	"dota2toons/internal/game"
 	"dota2toons/internal/mapdata"
+	"dota2toons/internal/network"
 )
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	// Allow connections from the Vite dev server and any origin in development.
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
+// ---------------------------------------------------------------------------
+// Global state
+// ---------------------------------------------------------------------------
+
+var (
+	upgrader = websocket.Upgrader{
+		ReadBufferSize:  4096,
+		WriteBufferSize: 4096,
+		CheckOrigin:     func(_ *http.Request) bool { return true },
+	}
+	mapDataGlobal *mapdata.MapData
+	roomsMu       sync.RWMutex
+	rooms         = make(map[string]*Room)
+)
+
+// ---------------------------------------------------------------------------
+// Room — one game instance + its connected sessions
+// ---------------------------------------------------------------------------
+
+type Room struct {
+	mu       sync.RWMutex
+	ID       string
+	Game     *game.GameInstance
+	Sessions map[string]*network.Session // clientID → session
+
+	// Lobby state before game starts
+	Lobby   []network.LobbyPlayer
+	Started bool
+
+	destroyedIDs []string // entities destroyed since last snapshot tick
 }
 
-// Client represents a single connected WebSocket client.
-type Client struct {
-	ID   string
-	Conn *websocket.Conn
-	Send chan []byte
-}
-
-// Hub manages all connected clients.
-type Hub struct {
-	Clients    map[string]*Client
-	Broadcast  chan []byte
-	Register   chan *Client
-	Unregister chan *Client
-}
-
-func newHub() *Hub {
-	return &Hub{
-		Clients:    make(map[string]*Client),
-		Broadcast:  make(chan []byte),
-		Register:   make(chan *Client),
-		Unregister: make(chan *Client),
+func newRoom(id string, md *mapdata.MapData) *Room {
+	return &Room{
+		ID:       id,
+		Game:     game.NewGameInstance(md),
+		Sessions: make(map[string]*network.Session),
 	}
 }
 
-func (h *Hub) run() {
-	for {
-		select {
-		case client := <-h.Register:
-			h.Clients[client.ID] = client
-			log.Printf("Client connected: %s (total: %d)", client.ID, len(h.Clients))
-		case client := <-h.Unregister:
-			if _, ok := h.Clients[client.ID]; ok {
-				delete(h.Clients, client.ID)
-				close(client.Send)
-				log.Printf("Client disconnected: %s (total: %d)", client.ID, len(h.Clients))
-			}
-		case message := <-h.Broadcast:
-			for _, client := range h.Clients {
-				select {
-				case client.Send <- message:
-				default:
-					close(client.Send)
-					delete(h.Clients, client.ID)
-				}
-			}
+func (r *Room) addSession(s *network.Session) {
+	r.mu.Lock()
+	r.Sessions[s.ClientID] = s
+	r.mu.Unlock()
+}
+
+func (r *Room) removeSession(clientID string) {
+	r.mu.Lock()
+	delete(r.Sessions, clientID)
+	r.mu.Unlock()
+}
+
+func (r *Room) broadcast(data []byte) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, s := range r.Sessions {
+		s.Write(data)
+	}
+}
+
+// broadcastSnapshots sends delta snapshots to all clients at 30 Hz.
+func (r *Room) broadcastSnapshots() {
+	ticker := time.NewTicker(time.Second / 30)
+	defer ticker.Stop()
+	for range ticker.C {
+		r.mu.RLock()
+		if len(r.Sessions) == 0 {
+			r.mu.RUnlock()
+			continue
+		}
+		r.mu.RUnlock()
+
+		r.mu.Lock()
+		destroyed := r.destroyedIDs
+		r.destroyedIDs = nil
+		r.mu.Unlock()
+
+		data, err := network.BuildDeltaSnapshot(r.Game.World(), r.Game.World().Tick, 0, destroyed)
+		if err == nil {
+			r.broadcast(data)
 		}
 	}
 }
 
-func (h *Hub) handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
+// ---------------------------------------------------------------------------
+// WebSocket handler
+// ---------------------------------------------------------------------------
+
+func handleWebSocket(w http.ResponseWriter, req *http.Request) {
+	conn, err := upgrader.Upgrade(w, req, nil)
 	if err != nil {
-		log.Printf("Upgrade error: %v", err)
+		log.Printf("WS upgrade error: %v", err)
 		return
 	}
 
-	// Use UUID for stable client identity.
-	clientID := r.URL.Query().Get("clientId")
+	clientID := req.URL.Query().Get("clientId")
 	if clientID == "" {
 		clientID = uuid.New().String()
 	}
+	roomID := req.URL.Query().Get("room")
 
-	client := &Client{
-		ID:   clientID,
-		Conn: conn,
-		Send: make(chan []byte, 256),
+	// Get or create room
+	roomsMu.Lock()
+	room, ok := rooms[roomID]
+	if !ok {
+		room = newRoom(roomID, mapDataGlobal)
+		rooms[roomID] = room
+		room.Game.Start()
+		go room.broadcastSnapshots()
+		log.Printf("Room %s created", roomID)
+	}
+	roomsMu.Unlock()
+
+	sess := network.NewSession(clientID, conn)
+	room.addSession(sess)
+	log.Printf("Client %s joined room %s", clientID, roomID)
+
+	// Send full snapshot immediately
+	if data, err := network.BuildFullSnapshot(room.Game.World(), room.Game.World().Tick); err == nil {
+		sess.Write(data)
 	}
 
-	h.Register <- client
+	go sess.WritePump()
+	readPump(sess, room)
 
-	go client.writePump()
-	go client.readPump(h)
+	room.removeSession(clientID)
+	log.Printf("Client %s left room %s", clientID, roomID)
 }
 
-func (c *Client) readPump(h *Hub) {
-	defer func() {
-		h.Unregister <- c
-		c.Conn.Close()
-	}()
-
+// readPump reads client messages and routes them.
+func readPump(sess *network.Session, room *Room) {
+	defer sess.Conn.Close()
 	for {
-		_, message, err := c.Conn.ReadMessage()
+		_, raw, err := sess.Conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("Read error from %s: %v", c.ID, err)
+				log.Printf("Read error from %s: %v", sess.ClientID, err)
 			}
 			break
 		}
-		log.Printf("Message from %s: %d bytes", c.ID, len(message))
-		h.Broadcast <- message
+
+		var env network.Envelope
+		if err := msgpack.Unmarshal(raw, &env); err != nil {
+			log.Printf("Bad envelope from %s: %v", sess.ClientID, err)
+			continue
+		}
+
+		handleMessage(sess, room, env)
 	}
 }
 
-func (c *Client) writePump() {
-	defer c.Conn.Close()
+func handleMessage(sess *network.Session, room *Room, env network.Envelope) {
+	switch env.Type {
+	case network.MsgJoinGame:
+		var cmd network.JoinGameCommand
+		if err := network.Decode(env.Data, &cmd); err != nil { return }
+		if cmd.ClientID != "" { sess.ClientID = cmd.ClientID }
+		// Send lobby state
+		lsData, _ := network.EncodeEnvelope(network.MsgLobbyState, &network.LobbyState{
+			GameID:  room.ID,
+			Players: room.Lobby,
+		})
+		sess.Write(lsData)
 
-	for {
-		message, ok := <-c.Send
-		if !ok {
-			c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
-			return
+	case network.MsgPickHero:
+		var cmd network.PickHeroCommand
+		if err := network.Decode(env.Data, &cmd); err != nil { return }
+		sess.HeroKey = cmd.HeroKey
+		// Spawn hero on pick
+		spawnX, spawnY := radiantSpawn(len(room.Sessions))
+		if sess.Team == "dire" {
+			spawnX, spawnY = direSpawn(len(room.Sessions))
 		}
+		heroID := room.Game.SpawnHero(cmd.HeroKey, sess.Team, sess.ClientID, spawnX, spawnY)
+		sess.HeroEntityID = heroID
 
-		w, err := c.Conn.NextWriter(websocket.BinaryMessage)
-		if err != nil {
-			return
-		}
-		w.Write(message)
+	case network.MsgMoveCommand:
+		var cmd network.MoveCommand
+		if err := network.Decode(env.Data, &cmd); err != nil { return }
+		room.Game.QueueInput(game.InputCommand{
+			Type: "move", Seq: cmd.Seq,
+			TargetX: cmd.TargetX, TargetY: cmd.TargetY,
+			ClientID: sess.ClientID, HeroEntityID: sess.HeroEntityID,
+		})
 
-		if err := w.Close(); err != nil {
-			return
-		}
+	case network.MsgAttackCommand:
+		var cmd network.AttackCommand
+		if err := network.Decode(env.Data, &cmd); err != nil { return }
+		room.Game.QueueInput(game.InputCommand{
+			Type: "attack", Seq: cmd.Seq,
+			TargetEntityID: cmd.TargetEntityID,
+			ClientID: sess.ClientID, HeroEntityID: sess.HeroEntityID,
+		})
+
+	case network.MsgStopCommand:
+		var cmd network.StopCommand
+		if err := network.Decode(env.Data, &cmd); err != nil { return }
+		room.Game.QueueInput(game.InputCommand{
+			Type: "stop", Seq: cmd.Seq,
+			ClientID: sess.ClientID, HeroEntityID: sess.HeroEntityID,
+		})
+
+	default:
+		log.Printf("Unknown msg type %q from %s", env.Type, sess.ClientID)
 	}
 }
 
-// jsonHandler wraps a value as a JSON HTTP response.
-func jsonHandler(v any) http.HandlerFunc {
-	data, err := json.Marshal(v)
-	if err != nil {
-		panic("json marshal failed: " + err.Error())
-	}
-	return func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Write(data)
-	}
-}
+// Spawn positions near respective fountains.
+func radiantSpawn(_ int) (float64, float64) { return -7328, -6810 }
+func direSpawn(_ int) (float64, float64)    { return 7152, 6720 }
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
 
 func main() {
-	// Load map data at startup
 	log.Println("Loading map data...")
-	mapData, err := mapdata.Load("mapdata/data")
+	md, err := mapdata.Load("mapdata/data")
 	if err != nil {
 		log.Fatalf("Failed to load map data: %v", err)
 	}
-	log.Printf(
-		"Map loaded: %d buildings, %d trees, %d walkable cells, %d lane paths",
-		len(mapData.Buildings), len(mapData.Trees), len(mapData.GridNav), len(mapData.Lanes),
-	)
+	mapDataGlobal = md
+	log.Printf("Map loaded: %d buildings, %d trees, %d walkable cells, %d lanes",
+		len(md.Buildings), len(md.Trees), len(md.GridNav), len(md.Lanes))
 
-	hub := newHub()
-	go hub.run()
+	// WebSocket game endpoint
+	http.HandleFunc("/ws", handleWebSocket)
 
-	// WebSocket endpoint
-	http.HandleFunc("/ws", hub.handleWebSocket)
-
-	// Map data API endpoints (pre-serialized for fast serving)
-	http.HandleFunc("/api/mapdata/mapdata.json", jsonHandler(map[string]any{
-		"buildings": mapData.Buildings,
-		"trees":     mapData.Trees,
-	}))
-	http.HandleFunc("/api/mapdata/gridnavdata.json", jsonHandler(map[string]any{
-		"data": mapData.GridNav,
-	}))
-	http.HandleFunc("/api/mapdata/elevationdata.json", jsonHandler(map[string]any{
-		"data": mapData.Elevation,
-	}))
-	http.HandleFunc("/api/mapdata/lanedata.json", jsonHandler(map[string]any{
-		"lanes": mapData.Lanes,
-	}))
-
-	// Also serve raw files as fallback
+	// Map data REST endpoints (JSON)
+	http.HandleFunc("/api/mapdata/mapdata.json", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"buildings": md.Buildings, "trees": md.Trees,
+		})
+	})
+	http.HandleFunc("/api/mapdata/gridnavdata.json", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": md.GridNav})
+	})
+	http.HandleFunc("/api/mapdata/elevationdata.json", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": md.Elevation})
+	})
+	http.HandleFunc("/api/mapdata/lanedata.json", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		_ = json.NewEncoder(w).Encode(map[string]any{"lanes": md.Lanes})
+	})
 	http.Handle("/api/mapdata/raw/", http.StripPrefix("/api/mapdata/raw/", http.FileServer(http.Dir("mapdata/data"))))
 
 	log.Println("Server starting on :8080")

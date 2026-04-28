@@ -19,6 +19,9 @@ import { TowerAISystem, parseTowerDefs, towerStatsForTier } from './systems/towe
 import { EconomySystem, RespawnSystem } from './systems/economy';
 import { AbilitySystem, StatusSystem } from './systems/ability';
 import { createDebugGrid, addLabel, MouseCoordTracker } from './game/debug';
+import { GameClient } from './network/client';
+import { PredictionBuffer } from './game/prediction';
+import type { EntityState } from './network/protocol';
 
 import {
   createPositionComponent,
@@ -61,6 +64,8 @@ const ELEVATION_SCALE = 80; // world units per elevation level
 interface UIState {
   status: string;
   mouseCoord: string;
+  networkConnected: boolean;
+  lobbyVisible: boolean;
   // Top bar
   gameClock: number;
   killsRadiant: number;
@@ -135,6 +140,9 @@ function TopBar({ ui }: { ui: UIState }) {
       <span style={{ color: '#888' }}>{clock}</span>
       <span style={{ color: '#666' }}>–</span>
       <span style={{ color: C.dire, fontWeight: 'bold' }}>{ui.killsDire}</span>
+      <span style={{ color: ui.networkConnected ? '#44ff88' : '#ff6644', fontSize: 10, marginLeft: 4 }}>
+        {ui.networkConnected ? '● online' : '● offline'}
+      </span>
     </div>
   );
 }
@@ -225,6 +233,72 @@ function BottomBar({ ui }: { ui: UIState }) {
 }
 
 // ── KillFeed ────────────────────────────────────────────────────────────────
+// ── Lobby screen ─────────────────────────────────────────────────────────────
+function LobbyScreen({ onJoin }: { onJoin: (room: string, name: string, hero: string) => void }) {
+  const [room, setRoom]   = React.useState('default');
+  const [name, setName]   = React.useState(`Player${Math.floor(Math.random()*1000)}`);
+  const [hero, setHero]   = React.useState('axe');
+
+  const heroes = ['axe','pudge','crystal_maiden','sniper','drow_ranger',
+                  'juggernaut','lion','lina','sven','witch_doctor'];
+
+  return (
+    <div style={{
+      position: 'absolute', inset: 0,
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      background: 'rgba(10,14,20,0.92)', zIndex: 200,
+    }}>
+      <div style={{
+        background: C.bg, border: `1px solid ${C.border}`,
+        borderRadius: 12, padding: 32, minWidth: 360,
+        fontFamily: 'monospace',
+      }}>
+        <div style={{ color: '#ccc', fontSize: 20, marginBottom: 24, textAlign: 'center' }}>
+          Dota 2 Toons
+        </div>
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <label style={{ color: '#888', fontSize: 11 }}>Player name</label>
+          <input value={name} onChange={e => setName(e.target.value)} style={{
+            background: C.bgLight, border: `1px solid ${C.border}`,
+            color: '#ccc', borderRadius: 4, padding: '6px 10px',
+            fontFamily: 'monospace', fontSize: 13, outline: 'none',
+          }} />
+
+          <label style={{ color: '#888', fontSize: 11 }}>Room</label>
+          <input value={room} onChange={e => setRoom(e.target.value)} style={{
+            background: C.bgLight, border: `1px solid ${C.border}`,
+            color: '#ccc', borderRadius: 4, padding: '6px 10px',
+            fontFamily: 'monospace', fontSize: 13, outline: 'none',
+          }} />
+
+          <label style={{ color: '#888', fontSize: 11 }}>Hero</label>
+          <select value={hero} onChange={e => setHero(e.target.value)} style={{
+            background: C.bgLight, border: `1px solid ${C.border}`,
+            color: '#ccc', borderRadius: 4, padding: '6px 10px',
+            fontFamily: 'monospace', fontSize: 13, outline: 'none',
+          }}>
+            {heroes.map(h => <option key={h} value={h}>{h.replace(/_/g, ' ')}</option>)}
+          </select>
+
+          <button onClick={() => onJoin(room, name, hero)} style={{
+            marginTop: 8,
+            background: C.radiant, border: 'none', color: '#fff',
+            borderRadius: 6, padding: '10px 0', fontSize: 14,
+            fontFamily: 'monospace', cursor: 'pointer', fontWeight: 'bold',
+          }}>
+            Play
+          </button>
+
+          <div style={{ color: '#444', fontSize: 10, textAlign: 'center', marginTop: 4 }}>
+            Connects to ws://localhost:8080 · Solo play if server offline
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function KillFeed({ events }: { events: UIState['killFeed'] }) {
   if (events.length === 0) return null;
   return (
@@ -382,9 +456,16 @@ function Scoreboard({ ui }: { ui: UIState }) {
 }
 
 // ── HUD root ────────────────────────────────────────────────────────────────
-function HUD({ ui, onSetUI }: { ui: UIState; onSetUI: (s: Partial<UIState>) => void }) {
+function HUD({ ui, onSetUI }: { ui: UIState; onSetUI: (s: Partial<UIState> & { _buyItem?: string; _joinRoom?: { room: string; name: string; hero: string } }) => void }) {
   return (
     <>
+      {/* Lobby screen */}
+      {ui.lobbyVisible && (
+        <LobbyScreen onJoin={(room, name, hero) =>
+          onSetUI({ lobbyVisible: false, _joinRoom: { room, name, hero } } as any)
+        } />
+      )}
+
       {/* Status message */}
       {ui.status && (
         <div style={{
@@ -516,9 +597,17 @@ class Game {
   // Creep visuals — one InstancedMesh per team, updated each frame
   private creepMeshRadiant: THREE.InstancedMesh | null = null;
   private creepMeshDire:    THREE.InstancedMesh | null = null;
-  private readonly MAX_CREEPS = 200; // max visible creeps per team
+  private readonly MAX_CREEPS = 200;
 
-  // Smoothed render rotation per entity (interpolated toward pos.rotation each frame)
+  // ── Networking ────────────────────────────────────────────────────────────
+  private netClient   : GameClient | null = null;
+  private prediction    = new PredictionBuffer();
+  /** When true, input commands are also sent to the server */
+  private networkMode   = false;
+  /** Tick counter for syncing with server */
+  private clientTick    = 0;
+
+  // Smoothed render rotation per entity
   private renderRotation = new Map<string, number>();
   // Previous-tick positions for render interpolation
   private prevPos = new Map<string, { x: number; y: number; z: number }>();
@@ -706,6 +795,16 @@ class Game {
     });
 
     this.status('Game loaded!', true);
+
+    // Show lobby screen — player picks room + hero before connecting
+    // Auto-connect if ?room= is in the URL (direct link)
+    const urlRoom = new URLSearchParams(location.search).get('room');
+    if (urlRoom) {
+      this.initNetwork(urlRoom);
+    } else {
+      this.setUI(s => ({ ...s, lobbyVisible: true }));
+    }
+
     this.startLoop();
   }
 
@@ -817,6 +916,10 @@ class Game {
     if (!this.selectedId) return;
     const combat = this.world.getComponent<any>(this.selectedId, 'combat');
     if (combat) combat.targetId = targetId;
+    // Forward to server
+    if (this.networkMode && this.netClient && this.selectedId === this.localHeroId) {
+      this.netClient.sendAttack(targetId);
+    }
   }
 
   private handleAbility(
@@ -888,6 +991,12 @@ class Game {
     path.reachedTarget = false;
     path.targetX = gameX;
     path.targetY = gameY;
+
+    // Also send to server when in network mode
+    if (this.networkMode && this.netClient && this.selectedId === this.localHeroId) {
+      this.netClient.sendMove(gameX, gameY);
+      this.prediction.push({ type: 'move', targetX: gameX, targetY: gameY }, this.clientTick);
+    }
   }
 
   private handleSelect(entityId: string | null): void {
@@ -921,6 +1030,9 @@ class Game {
     if (path) { path.waypoints = []; path.reachedTarget = true; }
     const vel  = this.world.getComponent<any>(this.selectedId, 'velocity');
     if (vel)  { vel.dx = 0; vel.dy = 0; }
+    if (this.networkMode && this.netClient && this.selectedId === this.localHeroId) {
+      this.netClient.sendStop();
+    }
   }
 
   // ── game loop ─────────────────────────────────────────────────────────────
@@ -1257,6 +1369,123 @@ class Game {
     }));
   }
 
+  // ── Networking ────────────────────────────────────────────────────────────
+
+  /** Called from the Lobby screen when player clicks Play. */
+  joinRoom(roomId: string, playerName: string, heroKey: string): void {
+    // If already connected, disconnect first
+    this.netClient?.disconnect();
+    this.netClient = null;
+    this.networkMode = false;
+
+    // Override local hero key if it differs from picked hero
+    const localRec = this.localHeroId ? this.entities.get(this.localHeroId) : null;
+    if (localRec && localRec.heroKey !== heroKey) {
+      // Re-spawn with the chosen hero (simplified — just update heroKey for now)
+      localRec.heroKey = heroKey;
+    }
+
+    this.initNetwork(roomId, playerName, heroKey);
+  }
+
+  private initNetwork(
+    roomOverride?: string,
+    nameOverride?: string,
+    heroOverride?: string
+  ): void {
+    const proto    = location.protocol === 'https:' ? 'wss' : 'ws';
+    const roomId   = roomOverride ?? new URLSearchParams(location.search).get('room') ?? 'default';
+    const clientId = `client_${Math.random().toString(36).slice(2, 9)}`;
+    const url      = `${proto}://${location.host}/ws?room=${encodeURIComponent(roomId)}&clientId=${clientId}`;
+
+    const client   = new GameClient(url);
+    const heroKey  = heroOverride ?? (this.localHeroId ? this.entities.get(this.localHeroId)?.heroKey : 'axe') ?? 'axe';
+    const name     = nameOverride ?? clientId;
+
+    client.on('connected', () => {
+      this.networkMode = true;
+      this.setUI(s => ({ ...s, networkConnected: true, status: 'Connected to server' }));
+      setTimeout(() => this.setUI(s => ({ ...s, status: '' })), 2000);
+
+      // Join the room
+      client.sendJoin(clientId, name);
+      client.sendPickHero(heroKey);
+    });
+
+    client.on('disconnected', () => {
+      this.networkMode = false;
+      this.setUI(s => ({ ...s, networkConnected: false, status: 'Disconnected — reconnecting...' }));
+    });
+
+    client.on('full_snapshot', (snap) => {
+      // Apply full snapshot to update server-controlled entities
+      // Local hero keeps its client-side predicted position
+      this.applyServerSnapshot(snap.ents, true);
+    });
+
+    client.on('delta_snapshot', (snap) => {
+      this.clientTick = snap.tick;
+      client.advanceTick();
+      this.applyServerSnapshot(snap.updates, false);
+
+      // Destroy server-removed entities (non-local only)
+      for (const id of snap.destroys) {
+        if (id === this.localHeroId) continue; // never destroy local hero
+        const entity = this.world.getEntity(id);
+        if (entity) entity.active = false;
+      }
+    });
+
+    client.on('death_event', (evt) => {
+      // Server confirmed a death — mark entity dead if we haven't already
+      const entity = this.world.getEntity(evt.eid);
+      if (entity && !this.world.hasComponent(evt.eid, 'dead')) {
+        this.world.addComponent(evt.eid, { componentId: 'dead', diedAt: Date.now() } as any);
+      }
+    });
+
+    client.connect();
+    this.netClient = client;
+  }
+
+  private applyServerSnapshot(entities: EntityState[], isFull: boolean): void {
+    for (const es of entities) {
+      // Never overwrite local hero position (prediction)
+      const isLocalHero = es.id === this.localHeroId;
+
+      const existing = this.world.getEntity(es.id);
+      if (!existing) {
+        // New entity from server — create in ECS if not a hero we track visually
+        if (es.ut === 'creep' || es.ut === 'tower') {
+          const e = this.world.createEntity(es.id);
+          this.world.addComponent(e.id, { componentId: 'position', x: es.x, y: es.y, z: es.z, rotation: es.rot } as any);
+          this.world.addComponent(e.id, { componentId: 'team', team: es.team } as any);
+          this.world.addComponent(e.id, { componentId: 'unitType', type: es.ut, subtype: es.sub } as any);
+          this.world.addComponent(e.id, { componentId: 'health', hp: es.hp, maxHp: es.mhp, mana: es.mp, maxMana: es.mmp } as any);
+        }
+      } else if (!isLocalHero) {
+        // Update existing non-local entity
+        const pos = this.world.getComponent<any>(es.id, 'position');
+        if (pos) { pos.x = es.x; pos.y = es.y; pos.z = es.z; pos.rotation = es.rot; }
+        const hp = this.world.getComponent<any>(es.id, 'health');
+        if (hp) { hp.hp = es.hp; hp.maxHp = es.mhp; hp.mana = es.mp; hp.maxMana = es.mmp; }
+        if (es.dead && !this.world.hasComponent(es.id, 'dead')) {
+          this.world.addComponent(es.id, { componentId: 'dead', diedAt: Date.now() } as any);
+        }
+      } else if (isLocalHero) {
+        // Reconciliation: server confirmed position — replay unACK'd commands
+        const pos = this.world.getComponent<any>(es.id, 'position');
+        if (pos && isFull) {
+          // On full snapshot, trust server completely
+          pos.x = es.x; pos.y = es.y; pos.z = es.z;
+          this.prediction.clear();
+        }
+        // Delta: don't overwrite — local prediction is more responsive
+      }
+    }
+    void isFull;
+  }
+
   centerOnHero(): void {
     const id = this.selectedId ?? this.localHeroId;
     if (!id) return;
@@ -1287,6 +1516,10 @@ class Game {
     if (combat) {
       if (def.bonuses.damageMin) { combat.damageMin += def.bonuses.damageMin; combat.damageMax += def.bonuses.damageMax ?? 0; }
       if (def.bonuses.armor)     combat.armor += def.bonuses.armor;
+    }
+    // Forward to server
+    if (this.networkMode && this.netClient) {
+      this.netClient.sendBuyItem(itemId);
     }
   }
 
@@ -1422,6 +1655,7 @@ function Root() {
   const [ui, setUI] = React.useState<UIState>({
     status: 'Initializing...', mouseCoord: '',
     gameClock: 0, killsRadiant: 0, killsDire: 0,
+    networkConnected: false, lobbyVisible: false,
     selectedHero: null, heroHp: 600, heroMaxHp: 600, heroMana: 200, heroMaxMana: 200,
     gold: 600, level: 1, xp: 0, xpToNext: 230,
     abilities: [], items: [null,null,null,null,null,null],
@@ -1432,8 +1666,9 @@ function Root() {
     updateUI = setUI;
     return () => { updateUI = null; };
   }, []);
-  return <HUD ui={ui} onSetUI={(p: Partial<UIState> & { _buyItem?: string }) => {
-    if (p._buyItem) { gameRef?.buyItem(p._buyItem); return; }
+  return <HUD ui={ui} onSetUI={(p: Partial<UIState> & { _buyItem?: string; _joinRoom?: { room: string; name: string; hero: string } }) => {
+    if (p._buyItem)   { gameRef?.buyItem(p._buyItem); return; }
+    if (p._joinRoom)  { gameRef?.joinRoom(p._joinRoom.room, p._joinRoom.name, p._joinRoom.hero); return; }
     setUI(s => ({ ...s, ...p }));
   }} />;
 }

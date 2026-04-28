@@ -138,16 +138,37 @@ export class EconomySystem implements System {
       const inv = world.getComponent<InventoryComponent>(heroId, InventoryComponentId);
       if (!inv) continue;
       inv.xp += xpEach;
-      this.checkLevelUp(inv);
+      this.checkLevelUp(inv, world, heroId);
     }
   }
 
-  private checkLevelUp(inv: InventoryComponent): void {
-    const maxLevel = XP_PER_LEVEL.length; // 11 entries → max level 11 with this table
+  private checkLevelUp(inv: InventoryComponent, world: World, heroId: string): void {
+    const maxLevel = XP_PER_LEVEL.length;
     while (inv.level < maxLevel && inv.xpToNextLevel > 0 && inv.xp >= inv.xpToNextLevel) {
       inv.xp -= inv.xpToNextLevel;
       inv.level++;
       inv.xpToNextLevel = XP_PER_LEVEL[inv.level] ?? 1050;
+
+      // Award a skill point on each level-up
+      const ab = world.getComponent<any>(heroId, 'ability');
+      if (ab && ab.skillPoints !== undefined) {
+        ab.skillPoints++;
+      }
+
+      // Stat gains per level (SPEC averages)
+      const hp = world.getComponent<HealthComponent>(heroId, HealthComponentId);
+      if (hp) {
+        hp.maxHp  += 60;   // +40-80 avg 60
+        hp.hp     += 60;   // heal the gained HP
+        hp.maxMana += 35;  // +20-50 avg 35
+        hp.mana   += 35;
+      }
+      const combat = world.getComponent<any>(heroId, 'combat');
+      if (combat) {
+        combat.damageMin += 3;   // +2-4 avg 3
+        combat.damageMax += 3;
+        combat.armor     += 0.4; // +0.3-0.5 avg 0.4
+      }
     }
   }
 }

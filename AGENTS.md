@@ -201,6 +201,28 @@ Full message type definitions are in SPEC.md.
 
 ## Development Workflow
 
+### ⚠️ Git Policy — Read This First
+
+**NEVER commit or push code unless the user explicitly says so in writing.**
+
+- Do NOT run `git commit` at any point unless the user writes something like:
+  - "commit", "commit this", "commit the code", "commit changes"
+- Do NOT run `git push` at any point unless the user writes something like:
+  - "push", "push it", "push upstream", "push to remote"
+- Do NOT combine commit + push into one action unless both are explicitly requested.
+
+**The only exception is the `wrap up` shortcut command:**
+
+When the user says **"wrap up"**, this is a shorthand for:
+1. Update `TODO.md` to reflect all completed and pending work
+2. Run `git add -A && git commit` with an appropriate message
+3. Run `git push` to push upstream
+
+No other phrases, implications, or context trigger a commit or push.
+When in doubt — **do not commit, do not push**.
+
+---
+
 ### Phase Progression
 
 Phases are in TODO.md. Follow this order:
@@ -218,9 +240,9 @@ Phase 7 (Networking) ─► Phase 8 (Polish)
 - **BE** works Phase 0-1 (cleanup + map data), then jumps to Phase 6-7 when FE reaches Phase 3+
 - Both agents converge at Phase 7 (networking) to integrate client and server
 
-### Verification
+### Validation Before Marking Work Done
 
-**Before marking a TODO item complete**:
+**Always validate before considering a task complete — never commit unvalidated code:**
 - FE: `npx tsc --noEmit` passes, `npm run build` succeeds, manual test in browser
 - BE: `go vet ./...` passes, `go build ./cmd/server` succeeds, `go test ./internal/...` passes
 

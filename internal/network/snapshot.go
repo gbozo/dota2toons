@@ -91,21 +91,58 @@ func BuildFullSnapshot(w *game.World, tick int) ([]byte, error) {
 }
 
 // BuildDeltaSnapshot serializes only changes since the base snapshot.
-// For now this sends all active entities as updates (full delta).
-// A proper implementation would diff against a cached previous state.
-func BuildDeltaSnapshot(w *game.World, tick, baseTick int, destroyedIDs []string) ([]byte, error) {
+// Filters entities by team vision: only sends entities visible to the specified team.
+func BuildDeltaSnapshot(w *game.World, tick, baseTick int, destroyedIDs []string, viewTeam string) ([]byte, error) {
 	snap := DeltaSnapshot{
 		Tick:     tick,
 		BaseTick: baseTick,
 		Destroys: destroyedIDs,
 	}
 
+	// Collect vision sources for the viewing team
+	type visionSource struct {
+		x, y, r float64
+	}
+	var sources []visionSource
 	for _, e := range w.Entities() {
-		if !e.Active {
+		if !e.Active { continue }
+		team := game.GetTeam(w, e.ID)
+		ut   := game.GetUnitType(w, e.ID)
+		pos  := game.GetPosition(w, e.ID)
+		if team == nil || ut == nil || pos == nil { continue }
+		if team.Team != viewTeam { continue }
+		switch ut.Type {
+		case "hero":
+			sources = append(sources, visionSource{pos.X, pos.Y, 1800})
+		case "tower":
+			sources = append(sources, visionSource{pos.X, pos.Y, 1800})
+		}
+	}
+
+	for _, e := range w.Entities() {
+		if !e.Active { continue }
+		es := BuildEntityState(w, e.ID)
+		if es == nil { continue }
+
+		// Always include entities on the same team
+		if es.Team == viewTeam {
+			snap.Updates = append(snap.Updates, *es)
 			continue
 		}
-		es := BuildEntityState(w, e.ID)
-		if es != nil {
+
+		// Check if entity is within vision range of any source
+		pos := game.GetPosition(w, e.ID)
+		if pos == nil { continue }
+		visible := false
+		for _, src := range sources {
+			dx := pos.X - src.x
+			dy := pos.Y - src.y
+			if dx*dx+dy*dy <= src.r*src.r {
+				visible = true
+				break
+			}
+		}
+		if visible {
 			snap.Updates = append(snap.Updates, *es)
 		}
 	}

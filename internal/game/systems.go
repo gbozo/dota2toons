@@ -549,6 +549,18 @@ func (s *EconomySystem) processKill(w *World, evt DeathEvent) {
 			} else {
 				inv.XPToNextLevel = 2000
 			}
+			// Stat gains per level (SPEC averages)
+			if hp := GetHealth(w, heroID); hp != nil {
+				hp.MaxHP += 60
+				hp.HP += 60
+				hp.MaxMana += 35
+				hp.Mana += 35
+			}
+			if combat := GetCombat(w, heroID); combat != nil {
+				combat.DamageMin += 3
+				combat.DamageMax += 3
+				combat.Armor += 0.4
+			}
 		}
 	}
 }

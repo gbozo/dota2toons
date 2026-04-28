@@ -77,6 +77,7 @@ func (r *Room) broadcast(data []byte) {
 }
 
 // broadcastSnapshots sends delta snapshots to all clients at 30 Hz.
+// Each client receives only entities visible to their team (vision filtering).
 func (r *Room) broadcastSnapshots() {
 	ticker := time.NewTicker(time.Second / 30)
 	defer ticker.Stop()
@@ -86,6 +87,10 @@ func (r *Room) broadcastSnapshots() {
 			r.mu.RUnlock()
 			continue
 		}
+		sessions := make([]*network.Session, 0, len(r.Sessions))
+		for _, s := range r.Sessions {
+			sessions = append(sessions, s)
+		}
 		r.mu.RUnlock()
 
 		r.mu.Lock()
@@ -93,9 +98,13 @@ func (r *Room) broadcastSnapshots() {
 		r.destroyedIDs = nil
 		r.mu.Unlock()
 
-		data, err := network.BuildDeltaSnapshot(r.Game.World(), r.Game.World().Tick, 0, destroyed)
-		if err == nil {
-			r.broadcast(data)
+		for _, sess := range sessions {
+			team := sess.Team
+			if team == "" { team = "radiant" } // default
+			data, err := network.BuildDeltaSnapshot(r.Game.World(), r.Game.World().Tick, 0, destroyed, team)
+			if err == nil {
+				sess.Write(data)
+			}
 		}
 	}
 }

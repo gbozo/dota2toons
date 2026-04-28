@@ -88,6 +88,7 @@ interface UIState {
     manaCost: number;
     level: number;
   }>;
+  skillPoints: number;
   // Inventory
   items: Array<string | null>;
   // Overlays
@@ -561,7 +562,7 @@ const DEBUG_MAP = false;
 // ---------------------------------------------------------------------------
 
 class Game {
-  private world          = createWorld();
+  world          = createWorld();
   private mapData: MapData | null = null;
   private scene: THREE.Scene | null = null;
   private camera: THREE.PerspectiveCamera | null = null;
@@ -582,7 +583,7 @@ class Game {
   private entities    = new Map<string, GameEntityRecord>();
   private entityMeshMap = new Map<string, string>();
   private selectedId: string | null = null;
-  private localHeroId: string | null = null;
+  localHeroId: string | null = null;
 
   // Creep + combat systems
   private creepSpawner: CreepSpawnerSystem | null = null;
@@ -769,6 +770,7 @@ class Game {
       onSelect:  (id)   => this.handleSelect(id),
       onAbility: (slot, targetEntityId, targetX, targetZ) =>
         this.handleAbility(slot, targetEntityId, targetX, targetZ !== undefined ? -targetZ : undefined),
+      onLevelUp: (slot) => this.handleLevelUp(slot),
       onStop:    ()     => this.handleStop(),
       onHold:    ()     => this.handleStop(),
     });
@@ -802,8 +804,8 @@ class Game {
     if (urlRoom) {
       this.initNetwork(urlRoom);
     } else {
-      // Lobby disabled — start directly in standalone mode
-      // this.setUI(s => ({ ...s, lobbyVisible: true }));
+      // Show lobby via the modal root (separate DOM tree, pointer-events:auto)
+      (window as any).__showLobby?.();
     }
 
     this.startLoop();
@@ -845,10 +847,13 @@ class Game {
     if (defs && defs.length >= 4) {
       const ids = defs.slice(0, 4).map(d => d.id) as [string, string, string, string];
       const ab = createAbilityComponent(ids);
-      ab.slots[0].level = 1; // start with level 1 in each ability
+      // Start with 4 skill points spent: each basic ability at level 1
+      ab.slots[0].level = 1;
       ab.slots[1].level = 1;
       ab.slots[2].level = 1;
-      ab.slots[3].level = 1;
+      // Ult starts unlearned (level 0) — unlocked at hero level 6
+      ab.slots[3].level = 0;
+      ab.skillPoints = 1; // 1 remaining point (heroes start at level 1, get 1 point)
       this.world.addComponent(entity.id, ab);
     }
 
@@ -1036,6 +1041,30 @@ class Game {
     }
   }
 
+  private handleLevelUp(slot: 0 | 1 | 2 | 3): void {
+    const heroId = this.localHeroId;
+    if (!heroId) return;
+    const ab = this.world.getComponent<AbilityComponent>(heroId, AbilityComponentId);
+    if (!ab || ab.skillPoints <= 0) return;
+
+    const s = ab.slots[slot];
+    if (!s) return;
+    const def = ABILITY_BY_ID.get(s.abilityId);
+    if (!def) return;
+
+    // Check max level
+    if (s.level >= def.maxLevel) return;
+
+    // R (slot 3) requires hero level 6+ to unlock
+    if (slot === 3) {
+      const inv = this.world.getComponent<any>(heroId, 'inventory');
+      if (!inv || inv.level < 6) return;
+    }
+
+    s.level++;
+    ab.skillPoints--;
+  }
+
   // ── game loop ─────────────────────────────────────────────────────────────
 
   private startLoop(): void {
@@ -1067,6 +1096,7 @@ class Game {
       this.syncCreeps(alpha);
       this.syncHudStats(frame);
       this.renderer?.render(this.scene!, this.camera!);
+      this.drawFogOfWar();
       this.drawHealthBars();
       this.rafId = requestAnimationFrame(loop);
     };
@@ -1166,6 +1196,98 @@ class Game {
   }
 
   private readonly _screenPos = new THREE.Vector3();
+
+  // ── Fog of War ─────────────────────────────────────────────────────────────
+
+  private fogCanvas: HTMLCanvasElement | null = null;
+  private fogCtx: CanvasRenderingContext2D | null = null;
+
+  private drawFogOfWar(): void {
+    if (!this.camera || !this.hudCanvas) return;
+
+    // Lazy-init a separate offscreen canvas for fog (same size as HUD canvas)
+    if (!this.fogCanvas) {
+      this.fogCanvas = document.createElement('canvas');
+      this.fogCanvas.width  = this.hudCanvas.width;
+      this.fogCanvas.height = this.hudCanvas.height;
+      this.fogCtx = this.fogCanvas.getContext('2d');
+    }
+    const ctx = this.fogCtx;
+    if (!ctx) return;
+
+    const W = this.fogCanvas.width;
+    const H = this.fogCanvas.height;
+    if (W !== this.hudCanvas.width || H !== this.hudCanvas.height) {
+      this.fogCanvas.width  = this.hudCanvas.width;
+      this.fogCanvas.height = this.hudCanvas.height;
+    }
+
+    // Fill with dark fog
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(0, 0, W, H);
+
+    // Cut out circles at each vision source (local team heroes + towers)
+    ctx.globalCompositeOperation = 'destination-out';
+
+    const localTeam = this.localHeroId
+      ? this.world.getComponent<any>(this.localHeroId, 'team')?.team
+      : 'radiant';
+
+    const VISION_DAY = 1800; // world units
+    const TOWER_VISION = 1800;
+
+    for (const entity of this.world.entities.values()) {
+      if (!entity.active) continue;
+      if (this.world.hasComponent(entity.id, 'dead')) continue;
+
+      const team = this.world.getComponent<any>(entity.id, 'team');
+      if (!team || team.team !== localTeam) continue;
+
+      const ut  = this.world.getComponent<any>(entity.id, 'unitType');
+      const pos = this.world.getComponent<PositionComponent>(entity.id, PositionComponentId);
+      if (!pos || !ut) continue;
+
+      const isHero  = ut.type === 'hero';
+      const isTower = ut.type === 'tower';
+      if (!isHero && !isTower) continue;
+
+      const visionRange = isTower ? TOWER_VISION : VISION_DAY;
+
+      // Project world position to screen
+      const worldY = pos.z * ELEVATION_SCALE + 50;
+      this._screenPos.set(pos.x, worldY, -pos.y);
+      this._screenPos.project(this.camera);
+      if (this._screenPos.z > 1) continue;
+
+      const sx = ( this._screenPos.x + 1) / 2 * W;
+      const sy = (-this._screenPos.y + 1) / 2 * H;
+
+      // Convert vision range (world units) to screen pixels
+      // Approximate: project a point offset by visionRange and measure screen distance
+      const edgePos = this._screenPos.clone();
+      edgePos.set(pos.x + visionRange, worldY, -pos.y);
+      edgePos.project(this.camera);
+      const edgeSx = (edgePos.x + 1) / 2 * W;
+      const radiusPx = Math.abs(edgeSx - sx);
+
+      // Radial gradient cutout
+      const gradient = ctx.createRadialGradient(sx, sy, radiusPx * 0.6, sx, sy, radiusPx);
+      gradient.addColorStop(0, 'rgba(0,0,0,1)');
+      gradient.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = gradient;
+      ctx.beginPath();
+      ctx.arc(sx, sy, radiusPx, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    ctx.globalCompositeOperation = 'source-over';
+
+    // Draw fog onto HUD canvas
+    const hudCtx = this.hudCtx;
+    if (hudCtx) {
+      hudCtx.drawImage(this.fogCanvas, 0, 0);
+    }
+  }
 
    private drawHealthBars(): void {
     const ctx = this.hudCtx;
@@ -1366,6 +1488,7 @@ class Game {
       heroMana:     hp?.mana  ?? s.heroMana,
       heroMaxMana:  hp?.maxMana ?? s.heroMaxMana,
       abilities,
+      skillPoints: ab?.skillPoints ?? 0,
       items: inv?.items ?? s.items,
     }));
   }
@@ -1421,16 +1544,16 @@ class Game {
     client.on('full_snapshot', (snap) => {
       // Apply full snapshot to update server-controlled entities
       // Local hero keeps its client-side predicted position
-      this.applyServerSnapshot(snap.ents, true);
+      this.applyServerSnapshot(snap.ents ?? [], true);
     });
 
     client.on('delta_snapshot', (snap) => {
       this.clientTick = snap.tick;
       client.advanceTick();
-      this.applyServerSnapshot(snap.updates, false);
+      this.applyServerSnapshot(snap.updates ?? [], false);
 
       // Destroy server-removed entities (non-local only)
-      for (const id of snap.destroys) {
+      for (const id of snap.destroys ?? []) {
         if (id === this.localHeroId) continue; // never destroy local hero
         const entity = this.world.getEntity(id);
         if (entity) entity.active = false;
@@ -1644,13 +1767,65 @@ class Game {
 // Bootstrap
 // ---------------------------------------------------------------------------
 
-// UI root
+// UI root (HUD: pointer-events:none so clicks pass to canvas below)
 const uiRoot = document.createElement('div');
+uiRoot.id = 'ui-root';
 uiRoot.style.cssText =
   'position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:10;';
 document.body.appendChild(uiRoot);
 
+// Modal root (Lobby/Shop: pointer-events:auto, hidden when no modal open)
+const modalRoot = document.createElement('div');
+modalRoot.id = 'modal-root';
+modalRoot.style.cssText =
+  'position:absolute;top:0;left:0;width:100%;height:100%;z-index:20;display:none;';
+document.body.appendChild(modalRoot);
+
 let updateUI: ((fn: (prev: UIState) => UIState) => void) | null = null;
+
+/** Show/hide the modal root DOM element based on whether any modal is open */
+function setModalVisible(visible: boolean): void {
+  modalRoot.style.display = visible ? 'block' : 'none';
+}
+
+// ── Modal component (rendered into modalRoot — separate React tree) ─────────
+function ModalUI(): React.ReactElement | null {
+  const [lobby, setLobby] = React.useState(false);
+  const [shop, setShop]   = React.useState(false);
+  const [shopGold, setShopGold] = React.useState(600);
+  const [shopItems, setShopItems] = React.useState<Array<string|null>>([null,null,null,null,null,null]);
+
+  // Expose controls globally
+  React.useEffect(() => {
+    (window as any).__showLobby = () => { setLobby(true); setModalVisible(true); };
+    (window as any).__hideLobby = () => { setLobby(false); setModalVisible(false); };
+    (window as any).__showShop  = (gold: number, items: Array<string|null>) => {
+      setShopGold(gold); setShopItems(items); setShop(true); setModalVisible(true);
+    };
+    (window as any).__hideShop  = () => { setShop(false); setModalVisible(false); };
+  }, []);
+
+  if (!lobby && !shop) return null;
+
+  return (
+    <>
+      {lobby && (
+        <LobbyScreen onJoin={(room, name, hero) => {
+          setLobby(false); setModalVisible(false);
+          gameRef?.joinRoom(room, name, hero);
+        }} />
+      )}
+      {shop && (
+        <Shop
+          gold={shopGold}
+          items={shopItems}
+          onBuy={(itemId) => { setShop(false); setModalVisible(false); gameRef?.buyItem(itemId); }}
+          onClose={() => { setShop(false); setModalVisible(false); }}
+        />
+      )}
+    </>
+  );
+}
 
 function Root() {
   const [ui, setUI] = React.useState<UIState>({
@@ -1659,7 +1834,7 @@ function Root() {
     networkConnected: false, lobbyVisible: false,
     selectedHero: null, heroHp: 600, heroMaxHp: 600, heroMana: 200, heroMaxMana: 200,
     gold: 600, level: 1, xp: 0, xpToNext: 230,
-    abilities: [], items: [null,null,null,null,null,null],
+    abilities: [], skillPoints: 0, items: [null,null,null,null,null,null],
     shopOpen: false, scoreboardOpen: false,
     killFeed: [], damageNumbers: [],
   });
@@ -1675,6 +1850,7 @@ function Root() {
 }
 
 createRoot(uiRoot).render(<Root />);
+createRoot(modalRoot).render(<ModalUI />);
 
 // Canvas
 const container = document.querySelector<HTMLDivElement>('#app')!;
@@ -1694,7 +1870,13 @@ window.addEventListener('resize', () => {
 
 window.addEventListener('keydown', e => {
   if (e.code === 'Space') { e.preventDefault(); gameRef?.centerOnHero(); }
-  if (e.code === 'KeyB')  { e.preventDefault(); updateUI?.(s => ({ ...s, shopOpen: !s.shopOpen })); }
+  if (e.code === 'KeyB') {
+    e.preventDefault();
+    const inv = gameRef?.localHeroId
+      ? gameRef.world.getComponent<any>(gameRef.localHeroId, 'inventory')
+      : null;
+    (window as any).__showShop?.(inv?.gold ?? 600, inv?.items ?? [null,null,null,null,null,null]);
+  }
   if (e.code === 'Tab')   { e.preventDefault(); updateUI?.(s => ({ ...s, scoreboardOpen: true })); }
 });
 window.addEventListener('keyup', e => {

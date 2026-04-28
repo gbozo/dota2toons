@@ -29,6 +29,7 @@ export type MoveCallback     = (worldX: number, worldY: number) => void;
 export type AttackCallback   = (entityId: string) => void;
 export type SelectCallback   = (entityId: string | null) => void;
 export type AbilityCallback  = (slot: 0 | 1 | 2 | 3, targetEntityId?: string, targetX?: number, targetY?: number) => void;
+export type LevelUpCallback  = (slot: 0 | 1 | 2 | 3) => void;
 export type StopCallback     = () => void;
 
 interface InputConfig {
@@ -44,6 +45,7 @@ interface InputConfig {
   onAttack:  AttackCallback;
   onSelect:  SelectCallback;
   onAbility: AbilityCallback;
+  onLevelUp: LevelUpCallback;
   onStop:    StopCallback;
   onHold:    StopCallback;
 }
@@ -99,6 +101,7 @@ export class InputManager {
   private onAttack:  AttackCallback;
   private onSelect:  SelectCallback;
   private onAbility: AbilityCallback;
+  private onLevelUp: LevelUpCallback;
   private onStop:    StopCallback;
   private onHold:    StopCallback;
 
@@ -113,6 +116,7 @@ export class InputManager {
     this.onAttack      = cfg.onAttack;
     this.onSelect      = cfg.onSelect;
     this.onAbility     = cfg.onAbility;
+    this.onLevelUp     = cfg.onLevelUp;
     this.onStop        = cfg.onStop;
     this.onHold        = cfg.onHold;
 
@@ -205,6 +209,15 @@ export class InputManager {
 
     const onKeyDown = (e: KeyboardEvent) => {
       this.keys.add(e.code);
+      // Ctrl+Q/W/E/R → level up ability
+      if (e.ctrlKey) {
+        switch (e.code) {
+          case 'KeyQ': e.preventDefault(); this.onLevelUp(0); return;
+          case 'KeyW': e.preventDefault(); this.onLevelUp(1); return;
+          case 'KeyE': e.preventDefault(); this.onLevelUp(2); return;
+          case 'KeyR': e.preventDefault(); this.onLevelUp(3); return;
+        }
+      }
       switch (e.code) {
         case 'KeyQ': this.onAbility(0); break;
         case 'KeyW': this.onAbility(1); break;

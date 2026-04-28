@@ -219,14 +219,14 @@ export class InputManager {
       this.keys.delete(e.code);
     };
 
-    this.canvas.addEventListener('contextmenu', onContextMenu);
+    document.addEventListener('contextmenu', onContextMenu);
     this.canvas.addEventListener('mousedown',   onMouseDown);
     window.addEventListener('mousemove',        onMouseMove);
     window.addEventListener('keydown',          onKeyDown);
     window.addEventListener('keyup',            onKeyUp);
 
     this.cleanupFns.push(
-      () => this.canvas.removeEventListener('contextmenu', onContextMenu),
+      () => document.removeEventListener('contextmenu', onContextMenu),
       () => this.canvas.removeEventListener('mousedown',   onMouseDown),
       () => window.removeEventListener('mousemove',        onMouseMove),
       () => window.removeEventListener('keydown',          onKeyDown),

@@ -802,7 +802,8 @@ class Game {
     if (urlRoom) {
       this.initNetwork(urlRoom);
     } else {
-      this.setUI(s => ({ ...s, lobbyVisible: true }));
+      // Lobby disabled — start directly in standalone mode
+      // this.setUI(s => ({ ...s, lobbyVisible: true }));
     }
 
     this.startLoop();

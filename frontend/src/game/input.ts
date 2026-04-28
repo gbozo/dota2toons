@@ -25,12 +25,14 @@ import * as THREE from 'three';
 // Types
 // ---------------------------------------------------------------------------
 
-export type MoveCallback     = (worldX: number, worldY: number) => void;
-export type AttackCallback   = (entityId: string) => void;
-export type SelectCallback   = (entityId: string | null) => void;
-export type AbilityCallback  = (slot: 0 | 1 | 2 | 3, targetEntityId?: string, targetX?: number, targetY?: number) => void;
-export type LevelUpCallback  = (slot: 0 | 1 | 2 | 3) => void;
-export type StopCallback     = () => void;
+export type MoveCallback          = (worldX: number, worldY: number) => void;
+export type AttackCallback        = (entityId: string) => void;
+export type SelectCallback        = (entityId: string | null) => void;
+export type AbilityCallback       = (slot: 0 | 1 | 2 | 3, targetEntityId?: string, targetX?: number, targetY?: number) => void;
+export type LevelUpCallback       = (slot: 0 | 1 | 2 | 3) => void;
+export type StopCallback          = () => void;
+/** Called with game-space (x, y) — NOT Three.js space — when right-click hits terrain with no entity pick. */
+export type GroundRightClickCallback = (gameX: number, gameY: number) => void;
 
 interface InputConfig {
   canvas: HTMLCanvasElement;
@@ -41,13 +43,15 @@ interface InputConfig {
   entityMeshMap: Map<string, string>;
   /** Scene — movement cursor ring is added here. */
   scene: THREE.Scene;
-  onMove:    MoveCallback;
-  onAttack:  AttackCallback;
-  onSelect:  SelectCallback;
-  onAbility: AbilityCallback;
-  onLevelUp: LevelUpCallback;
-  onStop:    StopCallback;
-  onHold:    StopCallback;
+  onMove?:              MoveCallback;   // kept for compatibility, not used by InputManager
+  onAttack:             AttackCallback;
+  onSelect:             SelectCallback;
+  /** Called when right-clicking terrain with no entity hit — provides game coords. */
+  onGroundRightClick:   GroundRightClickCallback;
+  onAbility:            AbilityCallback;
+  onLevelUp:            LevelUpCallback;
+  onStop:               StopCallback;
+  onHold:               StopCallback;
 }
 
 // ---------------------------------------------------------------------------
@@ -97,13 +101,13 @@ export class InputManager {
   pendingAbilityType: 'point' | 'unit_target' | null = null;
 
   // Callbacks
-  private onMove:    MoveCallback;
-  private onAttack:  AttackCallback;
-  private onSelect:  SelectCallback;
-  private onAbility: AbilityCallback;
-  private onLevelUp: LevelUpCallback;
-  private onStop:    StopCallback;
-  private onHold:    StopCallback;
+  private onAttack:             AttackCallback;
+  private onSelect:             SelectCallback;
+  private onGroundRightClick:   GroundRightClickCallback;
+  private onAbility:            AbilityCallback;
+  private onLevelUp:            LevelUpCallback;
+  private onStop:               StopCallback;
+  private onHold:               StopCallback;
 
   private cleanupFns: Array<() => void> = [];
 
@@ -112,13 +116,13 @@ export class InputManager {
     this.canvas        = cfg.canvas;
     this.terrainMesh   = cfg.terrainMesh;
     this.entityMeshMap = cfg.entityMeshMap;
-    this.onMove        = cfg.onMove;
-    this.onAttack      = cfg.onAttack;
-    this.onSelect      = cfg.onSelect;
-    this.onAbility     = cfg.onAbility;
-    this.onLevelUp     = cfg.onLevelUp;
-    this.onStop        = cfg.onStop;
-    this.onHold        = cfg.onHold;
+    this.onAttack            = cfg.onAttack;
+    this.onSelect            = cfg.onSelect;
+    this.onGroundRightClick  = cfg.onGroundRightClick;
+    this.onAbility           = cfg.onAbility;
+    this.onLevelUp           = cfg.onLevelUp;
+    this.onStop              = cfg.onStop;
+    this.onHold              = cfg.onHold;
 
     this.cursorRing = createCursorRing();
     cfg.scene.add(this.cursorRing);
@@ -193,7 +197,9 @@ export class InputManager {
         } else {
           const hit = this.raycastGround();
           if (hit) {
-            this.onMove(hit.x, hit.z);
+            // Pass game coordinates (x, -z) to the ground right-click handler
+            // which decides move vs attack based on nearby ECS entities
+            this.onGroundRightClick(hit.x, -hit.z);
             this.showCursorRing(hit);
           }
         }

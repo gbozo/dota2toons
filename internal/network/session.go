@@ -21,14 +21,17 @@ type Session struct {
 	LastACKTick int
 	// Sequence number of the last received input command
 	LastSeq int
+	// SnapCache holds per-session delta-compression state
+	SnapCache *SnapshotCache
 }
 
 // NewSession creates a session for an incoming WebSocket connection.
 func NewSession(clientID string, conn *websocket.Conn) *Session {
 	return &Session{
-		ClientID: clientID,
-		Conn:     conn,
-		Send:     make(chan []byte, 256),
+		ClientID:  clientID,
+		Conn:      conn,
+		Send:      make(chan []byte, 256),
+		SnapCache: NewSnapshotCache(),
 	}
 }
 

@@ -8,6 +8,7 @@ import { loadMapData, buildObjectBlockedSet, blockedSetToCoords } from './game/m
 import { createPerspectiveCamera, createGameScene } from './game/engine';
 import { createTerrain, createTreeInstances, createBuildingMeshes, createWalkableMesh } from './game/mapRenderer';
 import { CameraController } from './game/camera';
+import { audio } from './game/audio';
 import { HeroModelLoader } from './game/heroLoader';
 import type { HeroInstance } from './game/heroLoader';
 import { InputManager } from './game/input';
@@ -19,6 +20,7 @@ import { TowerAISystem, parseTowerDefs, towerStatsForTier } from './systems/towe
 import { EconomySystem, RespawnSystem } from './systems/economy';
 import { AbilitySystem, StatusSystem } from './systems/ability';
 import { createDebugGrid, addLabel, MouseCoordTracker } from './game/debug';
+import { getClientId, getPlayerName, getLastRoom, getLastHero, savePlayerName, saveLastRoom, saveLastHero } from './game/identity';
 import { GameClient } from './network/client';
 import { PredictionBuffer } from './game/prediction';
 import type { EntityState } from './network/protocol';
@@ -236,12 +238,21 @@ function BottomBar({ ui }: { ui: UIState }) {
 // ── KillFeed ────────────────────────────────────────────────────────────────
 // ── Lobby screen ─────────────────────────────────────────────────────────────
 function LobbyScreen({ onJoin }: { onJoin: (room: string, name: string, hero: string) => void }) {
-  const [room, setRoom]   = React.useState('default');
-  const [name, setName]   = React.useState(`Player${Math.floor(Math.random()*1000)}`);
-  const [hero, setHero]   = React.useState('axe');
+  const [room, setRoom] = React.useState(() => getLastRoom());
+  const [name, setName] = React.useState(() => getPlayerName() || `Player${Math.floor(Math.random() * 1000)}`);
+  const [hero, setHero] = React.useState(() => getLastHero());
 
   const heroes = ['axe','pudge','crystal_maiden','sniper','drow_ranger',
                   'juggernaut','lion','lina','sven','witch_doctor'];
+
+  const handleJoin = () => {
+    const trimName = name.trim() || 'Player';
+    savePlayerName(trimName);
+    saveLastRoom(room.trim() || 'default');
+    saveLastHero(hero);
+    audio.play('ui_click');
+    onJoin(room.trim() || 'default', trimName, hero);
+  };
 
   return (
     <div style={{
@@ -282,7 +293,7 @@ function LobbyScreen({ onJoin }: { onJoin: (room: string, name: string, hero: st
             {heroes.map(h => <option key={h} value={h}>{h.replace(/_/g, ' ')}</option>)}
           </select>
 
-          <button onClick={() => onJoin(room, name, hero)} style={{
+          <button onClick={handleJoin} style={{
             marginTop: 8,
             background: C.radiant, border: 'none', color: '#fff',
             borderRadius: 6, padding: '10px 0', fontSize: 14,
@@ -554,9 +565,10 @@ function makeSelectionRing(): THREE.Mesh {
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
-// Debug flag — set to true to show grid overlay and walkable mesh
+// Debug flags
 // ---------------------------------------------------------------------------
-const DEBUG_MAP = false;
+const DEBUG_MAP      = false; // walkable grid mesh overlay
+const DEBUG_CREEPS   = true;  // creep direction arrows + nav grid + occupied cells
 
 // Game
 // ---------------------------------------------------------------------------
@@ -603,10 +615,10 @@ class Game {
   // ── Networking ────────────────────────────────────────────────────────────
   private netClient   : GameClient | null = null;
   private prediction    = new PredictionBuffer();
-  /** When true, input commands are also sent to the server */
   private networkMode   = false;
-  /** Tick counter for syncing with server */
   private clientTick    = 0;
+  /** The client ID sent to the server — used to identify our hero in snapshots. */
+  private myClientId: string | null = null;
 
   // Smoothed render rotation per entity
   private renderRotation = new Map<string, number>();
@@ -619,6 +631,8 @@ class Game {
   private readonly TICK = 1000 / 30;
 
   private setUI: (fn: (prev: UIState) => UIState) => void = () => {};
+  /** Track local hero level to detect level-ups for the level-up sound. */
+  private localHeroLevel = 1;
 
   setUIUpdater(fn: (fn: (prev: UIState) => UIState) => void): void {
     this.setUI = fn;
@@ -647,12 +661,17 @@ class Game {
     this.world.registerSystem(this.abilitySystem);
     const laneWaypoints = parseLaneWaypoints(this.mapData.lanes);
     this.creepSpawner   = new CreepSpawnerSystem(laneWaypoints);
+    // Give spawner elevation lookup so creeps start at the correct terrain height
+    this.creepSpawner.setElevationFn((x, y) => this.movementSystem!.getElevation(x, y));
     this.world.registerSystem(this.creepSpawner);
+    this.creepAI.setPathfinding(this.pathfinding);
     this.world.registerSystem(this.creepAI);
     this.world.registerSystem(this.towerAI);
     this.world.registerSystem(this.combatSystem);
     this.world.registerSystem(this.economySystem);
     this.world.registerSystem(this.respawnSystem);
+    // Wire walkability into separation so pushes never cross into unwalkable cells
+    this.separation.setWalkableFn((x, y) => this.movementSystem!.isWalkable(x, y));
     this.world.registerSystem(this.separation);
 
     // Renderer
@@ -701,8 +720,9 @@ class Game {
     this.heroGroup.name = 'heroes';
     this.scene.add(this.heroGroup);
 
-    // Creep instanced meshes — simple capsule shapes, team-colored
-    const creepGeo = new THREE.CapsuleGeometry(20, 40, 4, 8);
+    // Creep instanced meshes — flat cylinders, clearly visible from top-down camera
+    // CylinderGeometry(radiusTop, radiusBottom, height, radialSegments)
+    const creepGeo = new THREE.CylinderGeometry(40, 40, 20, 8);
     this.creepMeshRadiant = new THREE.InstancedMesh(
       creepGeo,
       new THREE.MeshLambertMaterial({ color: 0x4a9eff }),
@@ -710,6 +730,7 @@ class Game {
     );
     this.creepMeshRadiant.name = 'creeps_radiant';
     this.creepMeshRadiant.count = 0;
+    this.creepMeshRadiant.frustumCulled = false;
     this.scene.add(this.creepMeshRadiant);
 
     this.creepMeshDire = new THREE.InstancedMesh(
@@ -719,6 +740,7 @@ class Game {
     );
     this.creepMeshDire.name = 'creeps_dire';
     this.creepMeshDire.count = 0;
+    this.creepMeshDire.frustumCulled = false;
     this.scene.add(this.creepMeshDire);
 
     // HUD canvas for health bars
@@ -765,9 +787,9 @@ class Game {
       terrainMesh: this.terrainMesh,
       entityMeshMap: this.entityMeshMap,
       scene: this.scene,
-      onMove:    (x, z) => this.handleMove(x, z),
       onAttack:  (id)   => this.handleAttackCommand(id),
       onSelect:  (id)   => this.handleSelect(id),
+      onGroundRightClick: (gameX, gameY) => this.handleGroundRightClick(gameX, gameY),
       onAbility: (slot, targetEntityId, targetX, targetZ) =>
         this.handleAbility(slot, targetEntityId, targetX, targetZ !== undefined ? -targetZ : undefined),
       onLevelUp: (slot) => this.handleLevelUp(slot),
@@ -922,9 +944,47 @@ class Game {
     if (!this.selectedId) return;
     const combat = this.world.getComponent<any>(this.selectedId, 'combat');
     if (combat) combat.targetId = targetId;
-    // Forward to server
     if (this.networkMode && this.netClient && this.selectedId === this.localHeroId) {
       this.netClient.sendAttack(targetId);
+    }
+  }
+
+  /**
+   * Right-click on empty ground: find the nearest enemy entity within a
+   * generous pick radius. If one is found, issue an attack; otherwise move.
+   * This lets players right-click on creeps, towers, and heroes even when
+   * their mesh isn't registered in the entity pick map.
+   */
+  private handleGroundRightClick(gameX: number, gameY: number): void {
+    const PICK_RADIUS = 200; // world units — generous for click-feel
+
+    const heroId = this.selectedId ?? this.localHeroId;
+    if (!heroId) { this.handleMove(gameX, -gameY); return; }
+
+    const myTeam = this.world.getComponent<any>(heroId, 'team')?.team as string | undefined;
+
+    let nearestId: string | null = null;
+    let nearestDist = PICK_RADIUS;
+
+    for (const entity of this.world.entities.values()) {
+      if (!entity.active) continue;
+      if (this.world.hasComponent(entity.id, 'dead')) continue;
+      const pos  = this.world.getComponent<PositionComponent>(entity.id, PositionComponentId);
+      const team = this.world.getComponent<any>(entity.id, 'team');
+      if (!pos || !team) continue;
+      // Only target enemies
+      if (!myTeam || team.team === myTeam || team.team === 'neutral') continue;
+      const dist = Math.hypot(pos.x - gameX, pos.y - gameY);
+      if (dist < nearestDist) {
+        nearestDist = dist;
+        nearestId = entity.id;
+      }
+    }
+
+    if (nearestId) {
+      this.handleAttackCommand(nearestId);
+    } else {
+      this.handleMove(gameX, -gameY);
     }
   }
 
@@ -968,6 +1028,7 @@ class Game {
 
     // Set pending cast — AbilitySystem consumes it next tick
     slotState.pendingCast = { targetEntityId, targetX, targetY };
+    audio.play('ability');
   }
 
   private handleMove(threeX: number, threeZ: number): void {
@@ -1098,6 +1159,7 @@ class Game {
       this.renderer?.render(this.scene!, this.camera!);
       this.drawFogOfWar();
       this.drawHealthBars();
+      if (DEBUG_CREEPS) this.drawCreepDebug();
       this.rafId = requestAnimationFrame(loop);
     };
     this.rafId = requestAnimationFrame(loop);
@@ -1168,13 +1230,13 @@ class Game {
       const team = this.world.getComponent<any>(entity.id, TeamComponentId);
       if (!pos || !team) continue;
 
-      // Interpolate position
+      // pos.z is always current — MovementSystem sets it every tick for all entities
       const prev = this.prevPos.get(entity.id);
       const rx = prev ? prev.x + (pos.x - prev.x) * alpha : pos.x;
       const ry = prev ? prev.y + (pos.y - prev.y) * alpha : pos.y;
       const rz = prev ? prev.z + (pos.z - prev.z) * alpha : pos.z;
 
-      const worldY = rz * ELEVATION_SCALE + 40;
+      const worldY = rz * ELEVATION_SCALE + 10; // +10 = half cylinder height, sits on terrain
       pos3.set(rx, worldY, -ry);
 
       // Rotate to face movement direction
@@ -1367,6 +1429,198 @@ class Game {
     this.drawDamageNumbers(ctx);
   }
 
+  // ── Creep pathfinder debug overlay ─────────────────────────────────────────
+  // Draws on the HUD canvas (no Three.js objects created per frame).
+  // Shows:
+  //   • Nav grid cells: green=walkable, red=blocked, yellow=occupied by a unit
+  //   • Per-creep: direction arrow (white) + line to current path target (cyan)
+  //   • State label: M(arch) / F(ight) in the cell
+
+  private drawCreepDebug(): void {
+    const ctx = this.hudCtx;
+    const cam = this.camera;
+    if (!ctx || !cam || !this.hudCanvas) return;
+
+    const W = this.hudCanvas.width;
+    const H = this.hudCanvas.height;
+
+    // ── 1. Nav grid ──────────────────────────────────────────────────────────
+    // Show a window of grid cells around the camera focus point.
+    // Only draw cells within a 4096-unit radius of the camera target.
+
+    if (this.movementSystem) {
+      const GRID       = 64;
+      const OFFSET     = -10464;
+      const WINDOW     = 16; // cells each side of camera centre
+      const camPos     = this.cameraCtrl?.position ?? { x: 0, z: 0 };
+      const centreGameX = camPos.x;
+      const centreGameY = -camPos.z;
+
+      const centreCol = Math.round((centreGameX - OFFSET) / GRID);
+      const centreRow = Math.round((centreGameY - OFFSET) / GRID);
+
+      // Build occupied-cell set from all active units
+      const occupied = new Set<string>();
+      for (const entity of this.world.entities.values()) {
+        if (!entity.active) continue;
+        const pos = this.world.getComponent<PositionComponent>(entity.id, PositionComponentId);
+        if (!pos) continue;
+        const gc = Math.round((pos.x - OFFSET) / GRID);
+        const gr = Math.round((pos.y - OFFSET) / GRID);
+        occupied.add(`${gc},${gr}`);
+      }
+
+      for (let dr = -WINDOW; dr <= WINDOW; dr++) {
+        for (let dc = -WINDOW; dc <= WINDOW; dc++) {
+          const gc = centreCol + dc;
+          const gr = centreRow + dr;
+          const wx = OFFSET + gc * GRID;
+          const wy = OFFSET + gr * GRID;
+
+          // Project world centre of cell to screen
+          const elev  = this.movementSystem.getElevation(wx, wy);
+          this._screenPos.set(wx, elev * ELEVATION_SCALE, -wy);
+          this._screenPos.project(cam);
+          if (this._screenPos.z > 1) continue;
+
+          const sx = ( this._screenPos.x + 1) / 2 * W;
+          const sy = (-this._screenPos.y + 1) / 2 * H;
+
+          // Project neighbour to estimate cell screen size
+          this._screenPos.set(wx + GRID, elev * ELEVATION_SCALE, -wy);
+          this._screenPos.project(cam);
+          const sx2    = ( this._screenPos.x + 1) / 2 * W;
+          const cellPx = Math.max(2, Math.abs(sx2 - sx));
+
+          const isWalkable = this.movementSystem.isWalkable(wx, wy);
+          const isOccupied = occupied.has(`${gc},${gr}`);
+
+          if (!isWalkable) {
+            ctx.fillStyle = 'rgba(255,40,40,0.18)';
+          } else if (isOccupied) {
+            ctx.fillStyle = 'rgba(255,220,0,0.30)';
+          } else {
+            ctx.fillStyle = 'rgba(40,255,80,0.08)';
+          }
+          ctx.fillRect(sx - cellPx / 2, sy - cellPx / 2, cellPx, cellPx);
+
+          // Cell border
+          ctx.strokeStyle = isOccupied ? 'rgba(255,220,0,0.5)'
+            : isWalkable ? 'rgba(40,255,80,0.15)'
+            : 'rgba(255,40,40,0.25)';
+          ctx.lineWidth = 0.5;
+          ctx.strokeRect(sx - cellPx / 2, sy - cellPx / 2, cellPx, cellPx);
+        }
+      }
+    }
+
+    // ── 2. Per-creep arrows ──────────────────────────────────────────────────
+    for (const entity of this.world.entities.values()) {
+      if (!entity.active) continue;
+      const laneAI = this.world.getComponent<any>(entity.id, LaneAIComponentId);
+      if (!laneAI) continue;
+
+      const pos  = this.world.getComponent<PositionComponent>(entity.id, PositionComponentId);
+      const path = this.world.getComponent<any>(entity.id, 'path');
+      if (!pos) continue;
+
+      const elev  = this.movementSystem?.getElevation(pos.x, pos.y) ?? 0;
+      const worldY = elev * ELEVATION_SCALE + 60;
+
+      // Project creep position to screen
+      this._screenPos.set(pos.x, worldY, -pos.y);
+      this._screenPos.project(cam);
+      if (this._screenPos.z > 1) continue;
+      const cx = ( this._screenPos.x + 1) / 2 * W;
+      const cy = (-this._screenPos.y + 1) / 2 * H;
+      if (cx < 0 || cx > W || cy < 0 || cy > H) continue;
+
+      const state: string = laneAI.state ?? 'march';
+      const isRadiant = laneAI.team === 'radiant';
+
+      // State label
+      ctx.font      = 'bold 9px monospace';
+      ctx.fillStyle = state === 'march' ? '#44ff88' : '#ff8844';
+      ctx.fillText(state === 'march' ? 'M' : 'F', cx + 4, cy - 4);
+
+      // Direction arrow from pos.rotation
+      if (pos.rotation !== undefined) {
+        const arrowLen = 20;
+        // game rotation: angle in game XY → Three XZ, so dx=cos(r), dy=sin(r) → screen
+        // project a point ahead of creep
+        const aheadX = pos.x + Math.cos(pos.rotation) * 100;
+        const aheadY = pos.y + Math.sin(pos.rotation) * 100;
+        this._screenPos.set(aheadX, worldY, -aheadY);
+        this._screenPos.project(cam);
+        if (this._screenPos.z <= 1) {
+          const ax = ( this._screenPos.x + 1) / 2 * W;
+          const ay = (-this._screenPos.y + 1) / 2 * H;
+          const dx = ax - cx;
+          const dy = ay - cy;
+          const len = Math.hypot(dx, dy);
+          if (len > 0.5) {
+            const nx = dx / len;
+            const ny = dy / len;
+            const tx = cx + nx * arrowLen;
+            const ty = cy + ny * arrowLen;
+
+            ctx.beginPath();
+            ctx.moveTo(cx, cy);
+            ctx.lineTo(tx, ty);
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+
+            // Arrowhead
+            const hw = 4;
+            ctx.beginPath();
+            ctx.moveTo(tx, ty);
+            ctx.lineTo(tx - nx * hw + ny * hw * 0.5, ty - ny * hw - nx * hw * 0.5);
+            ctx.lineTo(tx - nx * hw - ny * hw * 0.5, ty - ny * hw + nx * hw * 0.5);
+            ctx.closePath();
+            ctx.fillStyle = '#ffffff';
+            ctx.fill();
+          }
+        }
+      }
+
+      // Line to path target (next waypoint or fight target)
+      const wps = path?.waypoints;
+      if (wps && wps.length > 1) {
+        const wi = path.currentWaypointIndex ?? 1;
+        const wp = wps[Math.min(wi, wps.length - 1)];
+        const tElev = this.movementSystem?.getElevation(wp.x, wp.y) ?? 0;
+        this._screenPos.set(wp.x, tElev * ELEVATION_SCALE + 60, -wp.y);
+        this._screenPos.project(cam);
+        if (this._screenPos.z <= 1) {
+          const tx = ( this._screenPos.x + 1) / 2 * W;
+          const ty = (-this._screenPos.y + 1) / 2 * H;
+
+          ctx.beginPath();
+          ctx.moveTo(cx, cy);
+          ctx.lineTo(tx, ty);
+          ctx.strokeStyle = state === 'fight' ? 'rgba(255,100,50,0.7)' : 'rgba(80,200,255,0.7)';
+          ctx.lineWidth = 1;
+          ctx.setLineDash([4, 4]);
+          ctx.stroke();
+          ctx.setLineDash([]);
+
+          // Target dot
+          ctx.beginPath();
+          ctx.arc(tx, ty, 3, 0, Math.PI * 2);
+          ctx.fillStyle = state === 'fight' ? '#ff6432' : '#50c8ff';
+          ctx.fill();
+        }
+      }
+
+      // Team dot on creep
+      ctx.beginPath();
+      ctx.arc(cx, cy, 4, 0, Math.PI * 2);
+      ctx.fillStyle = isRadiant ? '#4a9eff' : '#ff4a4a';
+      ctx.fill();
+    }
+  }
+
   private drawDamageNumbers(ctx: CanvasRenderingContext2D): void {
     const now  = performance.now();
     const LIFE = 1200; // ms
@@ -1388,9 +1642,15 @@ class Game {
   private killsRadiant = 0;
   private killsDire    = 0;
 
-  /** Called each tick to process death events for kill feed + scoreboard. */
   private dmgNumSeq = 0;
   _dmgNums: UIState['damageNumbers'] = [];
+
+  /** Returns the local hero's world position, or null if unavailable. */
+  private localHeroPos(): { x: number; y: number } | null {
+    if (!this.localHeroId) return null;
+    const p = this.world.getComponent<PositionComponent>(this.localHeroId, PositionComponentId);
+    return p ? { x: p.x, y: p.y } : null;
+  }
 
   private processHitsForUI(): void {
     for (const evt of this.combatSystem.hitEvents) {
@@ -1404,10 +1664,16 @@ class Game {
       const color = evt.damageType === 'magical' ? '#88aaff' : '#ffffff';
       this._dmgNums.push({ id: ++this.dmgNumSeq, text: String(evt.damage), x: sx, y: sy, color, born: performance.now() });
       if (this._dmgNums.length > 30) this._dmgNums.shift();
+      // Positional hit sound — AudioManager handles radius + rate limiting
+      const lp = this.localHeroPos();
+      if (lp) audio.playAt('hit', pos.x, pos.y, lp.x, lp.y);
+      else    audio.play('hit');
     }
   }
 
   private processDeathsForUI(): void {
+    const lp = this.localHeroPos();
+
     for (const evt of this.combatSystem.deathEvents) {
       const ut   = this.world.getComponent<any>(evt.entityId, 'unitType');
       const team = this.world.getComponent<any>(evt.entityId, 'team');
@@ -1432,6 +1698,19 @@ class Game {
         killsDire: this.killsDire,
         killFeed: [...s.killFeed.slice(-4), { id, text, color }],
       }));
+
+      // Positional death/kill sounds
+      const epos = this.world.getComponent<PositionComponent>(evt.entityId, PositionComponentId);
+      if (evt.entityId === this.localHeroId) {
+        // Local hero death — always plays
+        audio.play('death');
+      } else if (epos && lp) {
+        if (evt.killerId === this.localHeroId) {
+          audio.playAt('kill', epos.x, epos.y, lp.x, lp.y);
+        } else {
+          audio.playAt('hit',  epos.x, epos.y, lp.x, lp.y);
+        }
+      }
 
       // Auto-dismiss after 5 s
       setTimeout(() => {
@@ -1475,6 +1754,13 @@ class Game {
       }
     }
 
+    // Detect local hero level-up and play sound
+    const currentLevel = inv?.level ?? 1;
+    if (currentLevel > this.localHeroLevel) {
+      this.localHeroLevel = currentLevel;
+      audio.play('levelup');
+    }
+
     this.setUI(s => ({
       ...s,
       gameClock:    clockSec,
@@ -1497,17 +1783,14 @@ class Game {
 
   /** Called from the Lobby screen when player clicks Play. */
   joinRoom(roomId: string, playerName: string, heroKey: string): void {
-    // If already connected, disconnect first
     this.netClient?.disconnect();
     this.netClient = null;
     this.networkMode = false;
 
-    // Override local hero key if it differs from picked hero
-    const localRec = this.localHeroId ? this.entities.get(this.localHeroId) : null;
-    if (localRec && localRec.heroKey !== heroKey) {
-      // Re-spawn with the chosen hero (simplified — just update heroKey for now)
-      localRec.heroKey = heroKey;
-    }
+    // Clear the offline hero — server will be the authority from here.
+    // selectedId and localHeroId will be re-assigned when the full_snapshot arrives.
+    this.selectedId  = null;
+    this.localHeroId = null;
 
     this.initNetwork(roomId, playerName, heroKey);
   }
@@ -1519,8 +1802,10 @@ class Game {
   ): void {
     const proto    = location.protocol === 'https:' ? 'wss' : 'ws';
     const roomId   = roomOverride ?? new URLSearchParams(location.search).get('room') ?? 'default';
-    const clientId = `client_${Math.random().toString(36).slice(2, 9)}`;
+    // Use persistent clientId — same across reloads and reconnects
+    const clientId = getClientId();
     const url      = `${proto}://${location.host}/ws?room=${encodeURIComponent(roomId)}&clientId=${clientId}`;
+    this.myClientId = clientId;
 
     const client   = new GameClient(url);
     const heroKey  = heroOverride ?? (this.localHeroId ? this.entities.get(this.localHeroId)?.heroKey : 'axe') ?? 'axe';
@@ -1550,7 +1835,9 @@ class Game {
     client.on('delta_snapshot', (snap) => {
       this.clientTick = snap.tick;
       client.advanceTick();
-      this.applyServerSnapshot(snap.updates ?? [], false);
+
+      // Handle creates (new entities entering vision) and updates (changed state)
+      this.applyServerSnapshot([...(snap.creates ?? []), ...(snap.updates ?? [])], false);
 
       // Destroy server-removed entities (non-local only)
       for (const id of snap.destroys ?? []) {
@@ -1574,7 +1861,46 @@ class Game {
 
   private applyServerSnapshot(entities: EntityState[], isFull: boolean): void {
     for (const es of entities) {
-      // Never overwrite local hero position (prediction)
+      // ── Claim our hero from the server ────────────────────────────────────
+      if (es.ut === 'hero' && es.oid && es.oid === this.myClientId) {
+        if (this.localHeroId !== es.id) {
+          // First time seeing our server hero — bootstrap the ECS entity
+          // so prediction (position, path, health, inventory) works locally.
+          let entity = this.world.getEntity(es.id);
+          if (!entity) {
+            entity = this.world.createEntity(es.id);
+            this.world.addComponent(entity.id, createPositionComponent(es.x, es.y, es.z, es.rot));
+            this.world.addComponent(entity.id, createVelocityComponent());
+            this.world.addComponent(entity.id, createTeamComponent(es.team as any));
+            this.world.addComponent(entity.id, createUnitTypeComponent('hero', es.sub));
+            this.world.addComponent(entity.id, createHealthComponent(es.hp, es.mhp, es.mp, es.mmp));
+            this.world.addComponent(entity.id, createCombatComponent(45, 55, 150, 1.7, 2));
+            this.world.addComponent(entity.id, createPathComponent());
+            this.world.addComponent(entity.id, createInventoryComponent(es.ex?.['gold'] ?? 600));
+            this.world.addComponent(entity.id, createStatusEffectsComponent());
+            this.world.addComponent(entity.id, createRespawnComponent(es.x, es.y));
+            // Add abilities if we know the hero key
+            const defs = HERO_ABILITIES[es.sub];
+            if (defs && defs.length >= 4) {
+              const ids = defs.slice(0, 4).map(d => d.id) as [string, string, string, string];
+              const ab = createAbilityComponent(ids);
+              ab.slots[0].level = 1;
+              ab.slots[1].level = 1;
+              ab.slots[2].level = 1;
+              ab.slots[3].level = 0;
+              ab.skillPoints = 1;
+              this.world.addComponent(entity.id, ab);
+            }
+          }
+
+          this.localHeroId = es.id;
+          this.selectedId  = es.id;
+          this.cameraCtrl?.centerOn(es.x, es.y);
+          this.setUI(s => ({ ...s, selectedHero: `${es.sub} (${es.team})` }));
+          this.prediction.clear();
+        }
+      }
+
       const isLocalHero = es.id === this.localHeroId;
 
       const existing = this.world.getEntity(es.id);
@@ -1641,6 +1967,7 @@ class Game {
       if (def.bonuses.damageMin) { combat.damageMin += def.bonuses.damageMin; combat.damageMax += def.bonuses.damageMax ?? 0; }
       if (def.bonuses.armor)     combat.armor += def.bonuses.armor;
     }
+    audio.play('buy');
     // Forward to server
     if (this.networkMode && this.netClient) {
       this.netClient.sendBuyItem(itemId);

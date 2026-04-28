@@ -29,6 +29,8 @@ import {
   type PathComponent,
 } from '../components/index';
 import type { DeathEvent } from './combat';
+// audio is NOT imported here — level-up sound is fired by the game loop
+// in main.tsx when the local hero's level changes, not per-hero.
 
 // Bounty tables per SPEC
 const CREEP_GOLD: Record<string, { min: number; max: number }> = {
@@ -169,6 +171,8 @@ export class EconomySystem implements System {
         combat.damageMax += 3;
         combat.armor     += 0.4; // +0.3-0.5 avg 0.4
       }
+
+      // Level-up sound is played by the game loop (main.tsx) for the local hero only.
     }
   }
 }

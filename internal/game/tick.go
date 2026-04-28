@@ -1,6 +1,7 @@
 package game
 
 import (
+	"math"
 	"sync"
 	"time"
 
@@ -102,12 +103,54 @@ func (g *GameInstance) SpawnHero(heroKey, team, clientID string, spawnX, spawnY 
 	return e.ID
 }
 
+// ReturnToSpawn paths a disconnected hero back to their spawn point using A*.
+// Safe to call from outside the tick goroutine — it queues a move command.
+func (g *GameInstance) ReturnToSpawn(heroEntityID EntityID) {
+	pos    := GetPosition(g.world, heroEntityID)
+	spawn  := GetRespawn(g.world, heroEntityID)
+	if pos == nil || spawn == nil {
+		return
+	}
+
+	// Don't bother if already at spawn
+	if math.Hypot(pos.X-spawn.SpawnX, pos.Y-spawn.SpawnY) < 128 {
+		return
+	}
+
+	pf := g.world.systems[1].(*MovementSystem).PF
+	wps := pf.FindPath(pos.X, pos.Y, spawn.SpawnX, spawn.SpawnY)
+	if len(wps) == 0 {
+		// Straight line fallback — just set the destination directly
+		wps = []Waypoint{{spawn.SpawnX, spawn.SpawnY}}
+	}
+
+	p := GetPath(g.world, heroEntityID)
+	if p == nil {
+		return
+	}
+	p.Waypoints = append([]Waypoint{{pos.X, pos.Y}}, wps...)
+	p.CurrentWaypointIndex = 0
+	p.ReachedTarget = false
+	p.TargetX = spawn.SpawnX
+	p.TargetY = spawn.SpawnY
+
+	// Clear any combat target so the hero doesn't fight on the way home
+	if combat := GetCombat(g.world, heroEntityID); combat != nil {
+		combat.TargetID = ""
+	}
+}
+
 func (g *GameInstance) spawnMapStructures(md *mapdata.MapData) {
 	tierHP := map[int]float64{1: 1300, 2: 1600, 3: 1900, 4: 2100}
 	tierDmg := map[int]float64{1: 100, 2: 120, 3: 140, 4: 160}
 
 	for _, b := range md.Buildings {
 		name := b.Name
+		// Skip non-attack structures: watch towers, fountains, barracks, ancients etc.
+		// Only spawn real attack towers (npc_dota_tower entities named dota_*guys_tower*).
+		if !contains(name, "tower") || contains(name, "watch_tower") {
+			continue
+		}
 		var tier int
 		switch {
 		case contains(name, "tower4"):
@@ -119,7 +162,7 @@ func (g *GameInstance) spawnMapStructures(md *mapdata.MapData) {
 		case contains(name, "tower"):
 			tier = 1
 		default:
-			continue // skip non-towers for now
+			continue
 		}
 		team := b.Team
 		if team == "" {

@@ -178,7 +178,12 @@ export function parseTowerDefs(
   buildings: Array<{ name: string; x: number; y: number; team: string }>
 ): TowerDef[] {
   return buildings
-    .filter(b => b.name.toLowerCase().includes('tower'))
+    .filter(b => {
+      const name = b.name.toLowerCase();
+      // Only real attack towers from npc_dota_tower — exclude watch towers,
+      // fountains, barracks, and other non-combat structures.
+      return name.includes('tower') && !name.includes('watch_tower') && !name.includes('watch tower');
+    })
     .map(b => {
       const name = b.name.toLowerCase();
       const tier = name.includes('tower4') ? 4

@@ -51,10 +51,11 @@ export interface EntityState {
   mp:    number;
   mmp:   number;
   team:  string;
-  ut:    string;   // unit type
-  sub:   string;   // subtype
+  ut:    string;
+  sub:   string;
   dead:  boolean;
-  ex?:   Record<string, number>; // gold, xp, level for heroes
+  oid?:  string;              // ownerClientId — only set for hero entities
+  ex?:   Record<string, number>;
 }
 
 export interface FullSnapshot {

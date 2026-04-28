@@ -46,13 +46,22 @@ type Room struct {
 	Started bool
 
 	destroyedIDs []string // entities destroyed since last snapshot tick
+
+	// Persistent identity: clientID → hero entity ID.
+	// Survives disconnect/reconnect within the same room.
+	heroByClient map[string]string
+
+	// Team balancing counters
+	radiantCount int
+	direCount    int
 }
 
 func newRoom(id string, md *mapdata.MapData) *Room {
 	return &Room{
-		ID:       id,
-		Game:     game.NewGameInstance(md),
-		Sessions: make(map[string]*network.Session),
+		ID:           id,
+		Game:         game.NewGameInstance(md),
+		Sessions:     make(map[string]*network.Session),
+		heroByClient: make(map[string]string),
 	}
 }
 
@@ -78,6 +87,7 @@ func (r *Room) broadcast(data []byte) {
 
 // broadcastSnapshots sends delta snapshots to all clients at 30 Hz.
 // Each client receives only entities visible to their team (vision filtering).
+// Uses per-session SnapshotCache for true delta compression.
 func (r *Room) broadcastSnapshots() {
 	ticker := time.NewTicker(time.Second / 30)
 	defer ticker.Stop()
@@ -100,8 +110,11 @@ func (r *Room) broadcastSnapshots() {
 
 		for _, sess := range sessions {
 			team := sess.Team
-			if team == "" { team = "radiant" } // default
-			data, err := network.BuildDeltaSnapshot(r.Game.World(), r.Game.World().Tick, 0, destroyed, team)
+			if team == "" { team = "radiant" }
+			data, err := network.BuildDeltaSnapshotCached(
+				r.Game.World(), r.Game.World().Tick,
+				destroyed, team, sess.SnapCache,
+			)
 			if err == nil {
 				sess.Write(data)
 			}
@@ -142,7 +155,7 @@ func handleWebSocket(w http.ResponseWriter, req *http.Request) {
 	room.addSession(sess)
 	log.Printf("Client %s joined room %s", clientID, roomID)
 
-	// Send full snapshot immediately
+	// Send full snapshot immediately (also covers reconnects — cache is fresh per NewSession)
 	if data, err := network.BuildFullSnapshot(room.Game.World(), room.Game.World().Tick); err == nil {
 		sess.Write(data)
 	}
@@ -150,15 +163,46 @@ func handleWebSocket(w http.ResponseWriter, req *http.Request) {
 	go sess.WritePump()
 	readPump(sess, room)
 
+	// Client disconnected — path their hero back to spawn
 	room.removeSession(clientID)
 	log.Printf("Client %s left room %s", clientID, roomID)
+	if sess.HeroEntityID != "" {
+		room.Game.ReturnToSpawn(sess.HeroEntityID)
+		log.Printf("Hero %s returning to spawn (client %s disconnected)", sess.HeroEntityID, clientID)
+	}
 }
 
 // readPump reads client messages and routes them.
+// Sends a WebSocket ping every 10 s; if no pong within 15 s the connection
+// is considered dead and the read loop exits (triggering ReturnToSpawn).
 func readPump(sess *network.Session, room *Room) {
-	defer sess.Conn.Close()
+	const (
+		pingInterval = 10 * time.Second
+		pongTimeout  = 15 * time.Second
+	)
+
+	conn := sess.Conn
+	conn.SetReadDeadline(time.Now().Add(pongTimeout))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(pongTimeout))
+		return nil
+	})
+
+	pingTicker := time.NewTicker(pingInterval)
+	defer pingTicker.Stop()
+	defer conn.Close()
+
+	// Run pings in a separate goroutine
+	go func() {
+		for range pingTicker.C {
+			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
+	}()
+
 	for {
-		_, raw, err := sess.Conn.ReadMessage()
+		_, raw, err := conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				log.Printf("Read error from %s: %v", sess.ClientID, err)
@@ -193,13 +237,53 @@ func handleMessage(sess *network.Session, room *Room, env network.Envelope) {
 		var cmd network.PickHeroCommand
 		if err := network.Decode(env.Data, &cmd); err != nil { return }
 		sess.HeroKey = cmd.HeroKey
-		// Spawn hero on pick
-		spawnX, spawnY := radiantSpawn(len(room.Sessions))
-		if sess.Team == "dire" {
-			spawnX, spawnY = direSpawn(len(room.Sessions))
+
+		room.mu.Lock()
+		existingHeroID, alreadySpawned := room.heroByClient[sess.ClientID]
+		room.mu.Unlock()
+
+		if alreadySpawned {
+			// Reconnect: reuse the existing hero entity
+			sess.HeroEntityID = existingHeroID
+			// Restore team from the hero's ECS component
+			if t := game.GetTeamFromWorld(room.Game.World(), existingHeroID); t != "" {
+				sess.Team = t
+			}
+			log.Printf("Client %s reconnected to existing hero %s", sess.ClientID, existingHeroID)
+		} else {
+			// First join: assign team and spawn hero
+			if sess.Team == "" {
+				room.mu.Lock()
+				if room.radiantCount <= room.direCount {
+					sess.Team = "radiant"
+					room.radiantCount++
+				} else {
+					sess.Team = "dire"
+					room.direCount++
+				}
+				room.mu.Unlock()
+			}
+
+			var spawnX, spawnY float64
+			if sess.Team == "dire" {
+				spawnX, spawnY = direSpawn(0)
+			} else {
+				spawnX, spawnY = radiantSpawn(0)
+			}
+			heroID := room.Game.SpawnHero(cmd.HeroKey, sess.Team, sess.ClientID, spawnX, spawnY)
+			sess.HeroEntityID = heroID
+
+			room.mu.Lock()
+			room.heroByClient[sess.ClientID] = heroID
+			room.mu.Unlock()
+			log.Printf("Client %s spawned new hero %s as %s", sess.ClientID, heroID, sess.Team)
 		}
-		heroID := room.Game.SpawnHero(cmd.HeroKey, sess.Team, sess.ClientID, spawnX, spawnY)
-		sess.HeroEntityID = heroID
+
+		// Reset snapshot cache and send full snapshot
+		sess.SnapCache = network.NewSnapshotCache()
+		if data, err := network.BuildFullSnapshot(room.Game.World(), room.Game.World().Tick); err == nil {
+			sess.Write(data)
+		}
 
 	case network.MsgMoveCommand:
 		var cmd network.MoveCommand

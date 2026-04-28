@@ -307,7 +307,8 @@ func towerSelectTarget(tower unitSnap, units map[string]unitSnap, attackRange fl
 }
 
 // ---------------------------------------------------------------------------
-// CreepAISystem
+// CreepAISystem — march to end of lane using waypoints; attack enemies in range;
+// resume march when enemy dies. No leash / return mechanic.
 // ---------------------------------------------------------------------------
 
 type creepUnitSnap struct {
@@ -315,20 +316,21 @@ type creepUnitSnap struct {
 	team string
 	ut   string
 }
-// CreepAISystem
-// ---------------------------------------------------------------------------
 
 const aggroRange = 500.0
-const leashRange = 800.0
+const waypointReachDist = 96.0
 
 type CreepAISystem struct{}
 
 func (s *CreepAISystem) Name() string { return "creepAI" }
 
 func (s *CreepAISystem) Update(_ float64, w *World) {
+	// Snapshot alive units for aggro checks
 	aliveUnits := map[string]creepUnitSnap{}
 	for _, e := range w.Entities() {
-		if w.HasComponent(e.ID, CDead) { continue }
+		if w.HasComponent(e.ID, CDead) {
+			continue
+		}
 		pos  := GetPosition(w, e.ID)
 		team := GetTeam(w, e.ID)
 		ut   := GetUnitType(w, e.ID)
@@ -338,77 +340,99 @@ func (s *CreepAISystem) Update(_ float64, w *World) {
 	}
 
 	for _, e := range w.Entities() {
-		if w.HasComponent(e.ID, CDead) { continue }
+		if w.HasComponent(e.ID, CDead) {
+			continue
+		}
 		ai := GetLaneAI(w, e.ID)
-		if ai == nil { continue }
+		if ai == nil {
+			continue
+		}
 		pos    := GetPosition(w, e.ID)
 		path   := GetPath(w, e.ID)
 		combat := GetCombat(w, e.ID)
-		if pos == nil || path == nil { continue }
+		if pos == nil || path == nil {
+			continue
+		}
 
 		switch ai.State {
 		case StateMarch:
+			// Check for nearby enemy — switch to fight
 			enemy := nearestEnemy(e.ID, ai.Team, pos, aliveUnits, aggroRange)
 			if enemy != "" {
-				ai.ReturnX, ai.ReturnY = pos.X, pos.Y
 				ai.AggroTargetID = enemy
 				ai.State = StateFight
-			} else if path.ReachedTarget {
-				// Reached end of lane
+				break
+			}
+			// Advance waypoint index when close enough
+			if len(path.Waypoints) > 0 {
+				wi := path.CurrentWaypointIndex
+				if wi >= len(path.Waypoints) {
+					wi = len(path.Waypoints) - 1
+				}
+				wp := path.Waypoints[wi]
+				dist := math.Hypot(wp.X-pos.X, wp.Y-pos.Y)
+				if dist < waypointReachDist && wi < len(path.Waypoints)-1 {
+					path.CurrentWaypointIndex = wi + 1
+				}
+			}
+			// If reached end of waypoints, stop (base destroyed / no more path)
+			if path.ReachedTarget {
 				path.Waypoints = nil
 			}
 
 		case StateFight, StateChase:
+			// Validate target
 			if ai.AggroTargetID != "" {
-				_, ok := aliveUnits[ai.AggroTargetID]
-				tHP  := GetHealth(w, ai.AggroTargetID)
+				tgt, ok := aliveUnits[ai.AggroTargetID]
+				tHP := GetHealth(w, ai.AggroTargetID)
 				if !ok || tHP == nil || tHP.HP <= 0 {
+					_ = tgt
 					ai.AggroTargetID = ""
 				}
 			}
+			// Re-acquire
 			if ai.AggroTargetID == "" {
 				enemy := nearestEnemy(e.ID, ai.Team, pos, aliveUnits, aggroRange)
 				if enemy != "" {
 					ai.AggroTargetID = enemy
 				} else {
-					ai.State = StateReturn
-					if combat != nil { combat.TargetID = "" }
+					// No enemies — resume march (no return)
+					ai.State = StateMarch
+					if combat != nil {
+						combat.TargetID = ""
+					}
 					break
 				}
 			}
-			if math.Hypot(pos.X-ai.ReturnX, pos.Y-ai.ReturnY) > leashRange {
-				ai.State = StateReturn
-				ai.AggroTargetID = ""
-				if combat != nil { combat.TargetID = "" }
+			tgtInfo, ok := aliveUnits[ai.AggroTargetID]
+			if !ok {
+				ai.State = StateMarch
 				break
 			}
-			tgtInfo, ok := aliveUnits[ai.AggroTargetID]
-			if !ok { ai.State = StateReturn; break }
-
 			attackRange := 100.0
-			if combat != nil { attackRange = combat.AttackRange }
+			if combat != nil {
+				attackRange = combat.AttackRange
+			}
 			dist := math.Hypot(tgtInfo.pos.X-pos.X, tgtInfo.pos.Y-pos.Y)
 			if dist > attackRange+8 {
+				// Chase: set path toward target directly (server uses simple waypoints)
 				path.Waypoints = []Waypoint{{pos.X, pos.Y}, {tgtInfo.pos.X, tgtInfo.pos.Y}}
 				path.CurrentWaypointIndex = 1
 				path.ReachedTarget = false
-				if combat != nil { combat.TargetID = "" }
+				if combat != nil {
+					combat.TargetID = ""
+				}
 			} else {
 				path.Waypoints = nil
 				path.ReachedTarget = true
-				if combat != nil { combat.TargetID = ai.AggroTargetID }
+				if combat != nil {
+					combat.TargetID = ai.AggroTargetID
+				}
 			}
 
 		case StateReturn:
-			dist := math.Hypot(pos.X-ai.ReturnX, pos.Y-ai.ReturnY)
-			if dist < 64 {
-				ai.State = StateMarch
-				ai.AggroTargetID = ""
-			} else {
-				path.Waypoints = []Waypoint{{pos.X, pos.Y}, {ai.ReturnX, ai.ReturnY}}
-				path.CurrentWaypointIndex = 1
-				path.ReachedTarget = false
-			}
+			// Legacy state — treat as march
+			ai.State = StateMarch
 		}
 	}
 }
@@ -609,10 +633,15 @@ func (s *RespawnSystem) Update(dt float64, w *World) {
 }
 
 // ---------------------------------------------------------------------------
-// SeparationSystem
+// SeparationSystem — spatial hash grid O(n) expected instead of O(n²)
 // ---------------------------------------------------------------------------
 
-const unitRadius = 32.0
+const unitRadius     = 32.0
+const separationDia  = unitRadius * 2
+// hashCell must be >= separationDia so only 3×3 neighbours need checking
+const hashCell       = separationDia // 64 world units
+
+type cellKey struct{ cx, cy int }
 
 type SeparationSystem struct{}
 
@@ -623,31 +652,55 @@ func (s *SeparationSystem) Update(_ float64, w *World) {
 		id string
 		p  *Position
 	}
-	units := make([]up, 0, 80)
+	units := make([]up, 0, 128)
 	for _, e := range w.Entities() {
 		p := GetPosition(w, e.ID)
 		if p != nil {
 			units = append(units, up{e.ID, p})
 		}
 	}
+	if len(units) == 0 {
+		return
+	}
 
-	dia := unitRadius * 2
-	for i := 0; i < len(units); i++ {
-		for j := i + 1; j < len(units); j++ {
-			a, b := units[i], units[j]
-			dx := b.p.X - a.p.X
-			dy := b.p.Y - a.p.Y
-			distSq := dx*dx + dy*dy
-			if distSq >= dia*dia || distSq < 0.0001 {
-				continue
+	// Build spatial hash
+	grid := make(map[cellKey][]int, len(units))
+	cell := func(x, y float64) cellKey {
+		return cellKey{int(math.Floor(x / hashCell)), int(math.Floor(y / hashCell))}
+	}
+	for i, u := range units {
+		k := cell(u.p.X, u.p.Y)
+		grid[k] = append(grid[k], i)
+	}
+
+	diaSq := separationDia * separationDia
+	for i := range units {
+		a := units[i]
+		cx := int(math.Floor(a.p.X / hashCell))
+		cy := int(math.Floor(a.p.Y / hashCell))
+
+		for nx := cx - 1; nx <= cx+1; nx++ {
+			for ny := cy - 1; ny <= cy+1; ny++ {
+				for _, j := range grid[cellKey{nx, ny}] {
+					if j <= i {
+						continue // each pair once
+					}
+					b := units[j]
+					dx := b.p.X - a.p.X
+					dy := b.p.Y - a.p.Y
+					distSq := dx*dx + dy*dy
+					if distSq >= diaSq || distSq < 0.0001 {
+						continue
+					}
+					dist := math.Sqrt(distSq)
+					overlap := (separationDia - dist) * 0.5
+					ex, ey := dx/dist, dy/dist
+					a.p.X -= ex * overlap
+					a.p.Y -= ey * overlap
+					b.p.X += ex * overlap
+					b.p.Y += ey * overlap
+				}
 			}
-			dist := math.Sqrt(distSq)
-			overlap := (dia - dist) * 0.5
-			nx, ny := dx/dist, dy/dist
-			a.p.X -= nx * overlap
-			a.p.Y -= ny * overlap
-			b.p.X += nx * overlap
-			b.p.Y += ny * overlap
 		}
 	}
 }

@@ -107,8 +107,9 @@ export class MovementSystem implements System {
       if (!pos || !vel) continue;
 
       if (path && path.waypoints.length > 0 && !path.reachedTarget) {
-        // Speed in world units/second — heroes are 300 u/s per SPEC
-        const speed = 300;
+        // Hero speed 300, creep speed 325 per SPEC
+        const isCreep = utype?.type === 'creep';
+        const speed   = isCreep ? 325 : 300;
         let remaining = speed * dtSec; // budget for this tick
 
         // Consume budget across multiple waypoints in a single tick
@@ -158,6 +159,10 @@ export class MovementSystem implements System {
         if (utype) pos.rotation = Math.atan2(vel.dy, vel.dx);
         vel.dx = 0;
         vel.dy = 0;
+      } else {
+        // Stationary — still keep z locked to terrain so units don't
+        // spawn or get pushed under/above the ground surface.
+        pos.z = this.getElevation(pos.x, pos.y);
       }
     }
   }
@@ -264,6 +269,13 @@ export class Pathfinding {
     }
   }
 
+  /** Pack a world coordinate into the grid integer key. Public for dynamic blocked sets. */
+  packWorld(x: number, y: number): number {
+    const col = Math.round((x - this.OFFSET) / this.GRID);
+    const row = Math.round((y - this.OFFSET) / this.GRID);
+    return row * this.COLS + col;
+  }
+
   private packXY(x: number, y: number): number {
     const col = Math.round((x - this.OFFSET) / this.GRID);
     const row = Math.round((y - this.OFFSET) / this.GRID);
@@ -278,10 +290,20 @@ export class Pathfinding {
     return this.OFFSET + grid * this.GRID;
   }
 
+  /** Optional per-query extra blocked set (dynamic unit obstacles). */
+  private dynamicBlocked: Set<number> | null = null;
+
+  /** Call before findPath to inject dynamic unit-occupied cells. */
+  setDynamicBlocked(s: Set<number> | null): void {
+    this.dynamicBlocked = s;
+  }
+
   private walkableAt(col: number, row: number): boolean {
     if (col < 0 || col >= this.COLS || row < 0 || row >= this.ROWS) return false;
     const key = row * this.COLS + col;
-    return this.insideMap.has(key) && !this.blocked.has(key);
+    if (!this.insideMap.has(key) || this.blocked.has(key)) return false;
+    if (this.dynamicBlocked && this.dynamicBlocked.has(key)) return false;
+    return true;
   }
 
   // Octile heuristic — exact for 8-dir grids (admissible + consistent)

@@ -100,7 +100,8 @@ type EntityState struct {
 	UnitType string             `msgpack:"ut"`
 	Subtype  string             `msgpack:"sub"`
 	Dead     bool               `msgpack:"dead"`
-	Extra    map[string]float64 `msgpack:"ex,omitempty"` // gold, level, etc.
+	OwnerID  string             `msgpack:"oid,omitempty"` // client ID that owns this hero
+	Extra    map[string]float64 `msgpack:"ex,omitempty"`  // gold, xp, level
 }
 
 // FullSnapshot sends the complete world state on connect.

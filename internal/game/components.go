@@ -335,3 +335,11 @@ func GetProjectile(w *World, id EntityID) *Projectile {
 	p, _ := v.(*Projectile)
 	return p
 }
+
+// GetTeamFromWorld returns the team string for an entity, or "" if not found.
+// Exported for use outside the package (e.g. server reconnect logic).
+func GetTeamFromWorld(w *World, id EntityID) string {
+	t := GetTeam(w, id)
+	if t == nil { return "" }
+	return t.Team
+}
